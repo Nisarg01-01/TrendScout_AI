@@ -1,0 +1,13 @@
+feedparser
+beautifulsoup4
+httpx
+spacy
+networkx
+neo4j
+chroma-hnswlib
+fastapi
+uvicorn
+pandas
+sqlalchemy
+psycopg2-binary
+scikit-learn
