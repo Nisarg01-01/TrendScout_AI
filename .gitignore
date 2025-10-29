@@ -30,3 +30,6 @@ wheels/
 .env
 env/
 venv/
+
+SETUP_GUIDE.md
+TEAM_SETUP_GUIDE.md

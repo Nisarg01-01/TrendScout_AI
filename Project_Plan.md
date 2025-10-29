@@ -1,6 +1,6 @@
 # Project_Plan
 
-## Part 1: Base Pipeline (Your MVP)
+## Part 1: Base Pipeline (MVP)
 
 ### Purpose
 Deliver a working end-to-end system that ingests TechCrunch RSS data legally, processes it, builds graphs, ranks startups, and exposes a minimal API and interface. This becomes the foundation for the full system.
@@ -28,7 +28,7 @@ Deliver a working end-to-end system that ingests TechCrunch RSS data legally, pr
 
 ---
 
-## Part 2: Full-Scale Project (Team Expansion Plan)
+## Part 2: Full-Scale Project
 
 ### Goal
 Extend the MVP into a research-grade Trend-Knowledge Graph + LLM forecasting system.
@@ -59,9 +59,3 @@ Extend the MVP into a research-grade Trend-Knowledge Graph + LLM forecasting sys
 - Momentum ranking and forecasting engine with SHAP explanations  
 - RAG-powered chat assistant for analysts  
 - Evaluation framework and reproducible reports
-
-### Summary
-| Stage | Owner | Output |
-|--------|--------|--------|
-| You (Base) | RSS→KG pipeline + API/UI | Working prototype |
-| Team (Expansion) | Enriched data, ontology, temporal + forecast + LLM chat | Complete TrendScout system |
