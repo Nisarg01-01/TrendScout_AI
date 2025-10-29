@@ -33,3 +33,6 @@ venv/
 
 SETUP_GUIDE.md
 TEAM_SETUP_GUIDE.md
+
+#Data files
+data/
