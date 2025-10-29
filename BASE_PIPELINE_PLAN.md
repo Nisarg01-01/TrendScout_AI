@@ -7,7 +7,7 @@ Implement the base version of the pipeline that ingests TechCrunch RSS data, pro
 
 ## 2. Folder Structure
 ```
-trendscout_base/
+TrendScout_AI/
 │
 ├── ingest_tc.py           # RSS ingestion
 ├── preprocess.py          # HTML clean, snippet split
