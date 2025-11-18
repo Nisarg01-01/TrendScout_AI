@@ -16,3 +16,7 @@ uvicorn
 streamlit
 PyDrive2
 sqlalchemy
+chromadb
+beautifulsoup4
+openai
+trafilatura

@@ -16,6 +16,7 @@ trendscout/
 ```
 
 ---
+### 1. 
 
 ## 2. File-by-File Details
 
@@ -25,7 +26,7 @@ Fetch RSS feeds, dedupe by link, append new rows.
 Columns: [source, title, link, summary, published, fetched_at]
 
 ### ingest_jobs.py
-Fetch GitHub AI startup jobs, dedupe by URL, append.
+F.etch GitHub AI startup jobs, dedupe by URL, append
 **Output:** data/jobs_raw.parquet  
 Columns: [company, title, location, url, posted_at, fetched_at]
 

@@ -32,8 +32,11 @@ FEEDS = [
     "https://venturebeat.com/feed/",
     "https://www.theverge.com/rss/index.xml",
     "https://www.wired.com/feed/rss",
-    "https://news.crunchbase.com/feed/"
+    "https://news.crunchbase.com/feed/",
+    "https://techcrunch.com/news-sitemap.xml",
+    "https://techcrunch.com/latest/"
 ]
+JOB_FEED=["https://github.com/vanshb03/New-Grad-2026"]
 
 # Keywords to keep only AI-related articles
 AI_KEYWORDS = [

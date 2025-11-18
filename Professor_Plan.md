@@ -3,6 +3,7 @@
 ## 1. Core Pipeline Concept
 
 1. **Get data from TechCrunch.**
+Install Chrom
 2. **Make a graph of the articles** based on connectivity:  
    If an article discusses startups S1, S2, S3 and another article discusses S3, S2, S8,  
    then S1 and S8 are considered somewhat connected.
