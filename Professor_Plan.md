@@ -3,7 +3,20 @@
 ## 1. Core Pipeline Concept
 
 1. **Get data from TechCrunch.**
-Install Chrom
+   Data ingestion
+
+   The user will be prompted to enter their query. Currently, the user has two options, (Jobs or news).
+   There will be an openai call to decide the query. Based on the specific keywords (Tech Related), all the latest information will be extracted from techcrunch. These news will be stored in chromaDB. If the query is about jobs, all the jobs will be displayed till date from github. (For simplicity in the code it has been limited to 20 jobs)
+
+   jobs_extraction.py will extract jobs from github
+   news_extraction.py will extracts news from TechCrunch
+   tag_query_classification.py will decide on the query type (Jobs or News)
+   chromadb_setup.py will push the news into the database.
+
+   To be implemented: 
+   Pushing jobs in PostgreSQL. 
+   Designing an optimal way of making sure same jobs are not fetched again. (Using timestamp, maybe)
+
 2. **Make a graph of the articles** based on connectivity:  
    If an article discusses startups S1, S2, S3 and another article discusses S3, S2, S8,  
    then S1 and S8 are considered somewhat connected.

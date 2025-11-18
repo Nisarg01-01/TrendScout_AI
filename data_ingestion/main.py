@@ -9,6 +9,7 @@ from jobs_extraction import extract_jobs_from_table
 from news_extractions import fetch_techcrunch_news
 from tag_query_classification import classify_tags
 from tag_query_classification import classify_query
+from chromadb_setup import store_news_in_chroma
 import re
 import os
 import feedparser
@@ -45,7 +46,9 @@ def main():
         all_news = []
         for tag in tags:
             all_news.extend(fetch_techcrunch_news(tag))
-
+        
+        store_news_in_chroma(all_news)
+        
         for item in all_news:
             print(f"- {item['title']}: {item['description']}")  
     
