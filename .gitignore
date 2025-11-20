@@ -36,3 +36,7 @@ TEAM_SETUP_GUIDE.md
 
 #Data files
 data/
+
+*.pdf
+
+*.png

@@ -49,6 +49,3 @@ def extract_jobs_from_table():
         })
 
     return jobs
-
-
-
