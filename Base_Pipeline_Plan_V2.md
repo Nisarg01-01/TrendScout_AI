@@ -17,6 +17,7 @@ trendscout/
 
 ---
 
+
 ## 2. File-by-File Details
 
 ### ingest_news.py
