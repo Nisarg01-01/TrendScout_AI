@@ -16,3 +16,4 @@ uvicorn
 streamlit
 PyDrive2
 sqlalchemy
+schedule
