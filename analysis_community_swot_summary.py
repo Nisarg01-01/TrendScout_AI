@@ -3,6 +3,7 @@ import sys
 from typing import Dict, Any
 
 import pandas as pd
+import numpy as np
 
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,10 +95,99 @@ def compute_community_temporal(df_kpi_comm: pd.DataFrame, df_snip: pd.DataFrame)
     return temporal
 
 
-def export_summaries(swot_rows: pd.DataFrame, ent_agg: pd.DataFrame, temporal: pd.DataFrame):
+def compute_forecast(temporal: pd.DataFrame) -> pd.DataFrame:
+    """
+    Predicting the future! (Or at least the next month).
+    I'm using a simple linear regression on the monthly mention counts for each community.
+    """
+    forecasts = []
+    
+    if temporal.empty:
+        return pd.DataFrame()
+
+    # Ensure we sort by date
+    temporal = temporal.sort_values(["community_id", "year_month"])
+
+    for cid, group in temporal.groupby("community_id"):
+        if len(group) < 2:
+            # Not enough data points to forecast
+            forecasts.append({
+                "community_id": cid,
+                "slope": 0.0,
+                "predicted_next_month": group["entity_mentions"].iloc[-1] if not group.empty else 0
+            })
+            continue
+
+        # Create X (time steps) and Y (mentions)
+        y = group["entity_mentions"].values
+        x = np.arange(len(y))
+
+        # Simple linear regression: y = mx + c
+        # We use numpy's polyfit for a degree 1 polynomial (line)
+        slope, intercept = np.polyfit(x, y, 1)
+
+        # Predict next step
+        next_x = len(y)
+        prediction = slope * next_x + intercept
+
+        forecasts.append({
+            "community_id": cid,
+            "slope": slope,
+            "predicted_next_month": max(0, prediction) # No negative mentions
+        })
+
+    return pd.DataFrame(forecasts)
+
+
+def compute_ranking(ent_agg: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    The Grand Ranking Algorithm.
+    Score = α·centrality + β·(pos−neg) + γ·recency + ε·community_growth
+    
+    Here:
+    - Centrality/Popularity = 'mentions'
+    - Sentiment = 'avg_stance'
+    - Community Growth = 'slope' from forecast
+    """
+    if ent_agg.empty:
+        return pd.DataFrame()
+
+    # Merge entity data with community forecast
+    # If no forecast (e.g. new community), fill with 0
+    merged = ent_agg.merge(forecast_df, on="community_id", how="left").fillna(0)
+
+    # Weights (Alpha, Beta, Gamma/Epsilon)
+    W_MENTIONS = 1.0
+    W_STANCE = 5.0   # Stance is -1 to 1, so we boost its impact
+    W_GROWTH = 10.0  # Growth slope is usually small, boost it
+
+    # Calculate Score
+    # We normalize stance from [-1, 1] to [0, 1] for scoring? 
+    # Actually, let's keep it raw. A negative stance should hurt the score if we are looking for "Hot & Good" startups.
+    # But "Hot & Bad" (scandals) are also trends. 
+    # Let's assume "Trend Score" implies magnitude of interest + positive sentiment.
+    
+    merged["score"] = (
+        (merged["mentions"] * W_MENTIONS) + 
+        (merged["avg_stance"] * W_STANCE) + 
+        (merged["slope"] * W_GROWTH)
+    )
+
+    # Sort by score descending
+    ranked = merged.sort_values("score", ascending=False).reset_index(drop=True)
+    
+    # Add rank column
+    ranked["rank"] = ranked.index + 1
+    
+    return ranked
+
+
+def export_summaries(swot_rows: pd.DataFrame, ent_agg: pd.DataFrame, temporal: pd.DataFrame, forecast: pd.DataFrame, ranking: pd.DataFrame):
     out_swot = os.path.join(config.DATA_DIR, "community_swot_summary.parquet")
     out_ent = os.path.join(config.DATA_DIR, "community_entity_summary.parquet")
     out_temp = os.path.join(config.DATA_DIR, "community_temporal_summary.parquet")
+    out_forecast = os.path.join(config.DATA_DIR, "community_forecast.parquet")
+    out_ranking = os.path.join(config.DATA_DIR, "entity_ranking.parquet")
 
     if not swot_rows.empty:
         swot_rows.to_parquet(out_swot, index=False)
@@ -117,8 +207,16 @@ def export_summaries(swot_rows: pd.DataFrame, ent_agg: pd.DataFrame, temporal: p
     else:
         print("No temporal aggregation to save.")
 
+    if not forecast.empty:
+        forecast.to_parquet(out_forecast, index=False)
+        print(f"Saved community forecast to {out_forecast}")
+    
+    if not ranking.empty:
+        ranking.to_parquet(out_ranking, index=False)
+        print(f"Saved entity ranking to {out_ranking}")
 
-def print_quick_sample(ent_agg: pd.DataFrame):
+
+def print_quick_sample(ent_agg: pd.DataFrame, ranking: pd.DataFrame):
     if ent_agg.empty:
         return
 
@@ -128,6 +226,10 @@ def print_quick_sample(ent_agg: pd.DataFrame):
         sub = ent_agg[ent_agg["community_id"] == cid].sort_values("mentions", ascending=False).head(5)
         print(f"\nCommunity {cid}:")
         print(sub[["entity_name", "mentions", "avg_stance"]].to_string(index=False))
+
+    if not ranking.empty:
+        print("\n--- TOP 10 TRENDING ENTITIES ---")
+        print(ranking[["rank", "entity_name", "community_id", "score", "mentions", "slope"]].head(10).to_string(index=False))
 
 
 def main():
@@ -143,9 +245,13 @@ def main():
 
     swot_rows, ent_agg = compute_community_swot(df_kpi_comm)
     temporal = compute_community_temporal(df_kpi_comm, df_snip)
+    
+    # New steps: Forecast and Rank
+    forecast = compute_forecast(temporal)
+    ranking = compute_ranking(ent_agg, forecast)
 
-    export_summaries(swot_rows, ent_agg, temporal)
-    print_quick_sample(ent_agg)
+    export_summaries(swot_rows, ent_agg, temporal, forecast, ranking)
+    print_quick_sample(ent_agg, ranking)
 
 
 if __name__ == "__main__":

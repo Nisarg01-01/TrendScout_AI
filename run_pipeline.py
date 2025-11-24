@@ -24,7 +24,13 @@ PIPELINE_STEPS = [
     "graph_build.py",
     "analysis_article_communities.py",
     "analysis_community_swot_summary.py",
-    "rag_index.py"
+    "rag_index.py",
+    "load_chroma.py"
+]
+
+BOOTSTRAP_STEPS = [
+    "debug/bootstrap_techcrunch_2025.py",
+    "debug/preprocess_bootstrap.py"
 ]
 
 def run_script(script_name):
@@ -75,12 +81,30 @@ if __name__ == "__main__":
         action='store_true',
         help="Perform a clean run by deleting all existing data and clearing the database."
     )
+    parser.add_argument(
+        '--bootstrap',
+        action='store_true',
+        help="Run the bootstrap scripts to seed the system with historical data."
+    )
     args = parser.parse_args()
 
     if args.clean:
         clean_workspace()
 
     print("🚀🚀🚀 STARTING DATA PIPELINE 🚀🚀🚀")
-    for step in PIPELINE_STEPS:
+    
+    steps_to_run = PIPELINE_STEPS.copy()
+    
+    if args.bootstrap:
+        print("ℹ️ Bootstrap mode enabled. Injecting bootstrap steps.")
+        # Insert bootstrap steps after ingestion (index 2) but before preprocessing
+        # Current list: ingest_news, ingest_jobs, preprocess...
+        # We want: ingest_news, ingest_jobs, bootstrap..., preprocess...
+        # Actually, preprocess_bootstrap appends to snippets. preprocess.py also appends.
+        # So order between them doesn't strictly matter, but let's put bootstrap early.
+        for step in reversed(BOOTSTRAP_STEPS):
+            steps_to_run.insert(2, step)
+
+    for step in steps_to_run:
         run_script(step)
     print("✅✅✅ PIPELINE COMPLETED SUCCESSFULLY ✅✅✅")

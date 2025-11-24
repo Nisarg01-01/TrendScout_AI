@@ -31,14 +31,7 @@ wheels/
 env/
 venv/
 
-SETUP_GUIDE.md
-TEAM_SETUP_GUIDE.md
+# Generated Vector DB (Re-creatable from data/)
+chroma_db/
 
-#Data files
-data/
-
-*.pdf
-
-*.png
-
-*.md 
+# Ignore large binary files if any, but keeping data/ as requested
