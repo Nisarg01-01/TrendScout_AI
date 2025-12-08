@@ -7,10 +7,8 @@ import os
 import config
 
 def extract_jobs_from_table():
-    """
-    I'm going to scrape that GitHub README to find job listings.
-    It's a markdown table, so I'll use some regex magic to pull out the rows.
-    """
+    """Extract job listings from GitHub README markdown table."""
+    
     try:
         response = requests.get(config.JOBS_URL)
         response.raise_for_status()
@@ -43,7 +41,7 @@ def extract_jobs_from_table():
             total_rows += 1
             company, role, location, apply_html, date_posted = cols[:5]
 
-            # I only care about AI jobs, so I'll check the company and role against our keywords.
+            # Filter for AI-related jobs using keywords
             combined_text = (company + " " + role).lower()
             if not any(k in combined_text for k in config.AI_KEYWORDS):
                 continue
@@ -71,10 +69,8 @@ def extract_jobs_from_table():
         return pd.DataFrame()
 
 def save_jobs(new_df: pd.DataFrame):
-    """
-    Saving the jobs to our parquet file.
-    Standard procedure: check for duplicates based on the URL so we don't double-count.
-    """
+    """Save jobs to parquet file, deduplicating by URL."""
+    
     if new_df.empty:
         print("No jobs found.")
         return

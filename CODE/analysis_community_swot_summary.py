@@ -32,25 +32,20 @@ def load_data() -> Dict[str, pd.DataFrame]:
 
 
 def enrich_with_community(df_kpi: pd.DataFrame, df_comm: pd.DataFrame) -> pd.DataFrame:
-    """
-    I'm joining the KPI data with the community IDs we found earlier.
-    This way, every entity mention or SWOT point knows which 'neighborhood' of articles it belongs to.
-    """
+    """Join KPI data with community IDs, filtering out unassigned articles."""
+    
     merged = df_kpi.merge(df_comm, how="left", on="snippet_id")
-    # If an article didn't make it into a community (maybe it was isolated), we'll drop it here.
+    # Drop articles not assigned to any community
     merged = merged[merged["community_id"].notna()].copy()
     return merged
 
 
 def compute_community_swot(df_kpi_comm: pd.DataFrame) -> pd.DataFrame:
-    """
-    Let's crunch the numbers for each community.
-    I'll count up the Strengths, Weaknesses, Opportunities, and Threats.
-    I'll also see which entities are the most popular in each group and what the general vibe (stance) is.
-    """
+    """Aggregate SWOT counts and entity mentions for each community."""
+    
     rows = []
 
-    # First, let's handle the SWOT analysis counts
+    # Aggregate SWOT analysis counts
     df_swot = df_kpi_comm[df_kpi_comm["category"] == "SWOT"].copy()
     for (cid, swot_type), g in df_swot.groupby(["community_id", "detail_type"]):
         rows.append(
@@ -62,7 +57,7 @@ def compute_community_swot(df_kpi_comm: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    # Now, let's look at the entities: who are they and how are they perceived?
+    # Aggregate entity mentions and sentiment
     df_ent = df_kpi_comm[df_kpi_comm["category"] == "Entity"].copy()
     df_ent = df_ent[df_ent["entity_name"].notna() & (df_ent["entity_name"].str.strip() != "")]
     ent_agg = (
@@ -74,19 +69,17 @@ def compute_community_swot(df_kpi_comm: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_community_temporal(df_kpi_comm: pd.DataFrame, df_snip: pd.DataFrame) -> pd.DataFrame:
-    """
-    Time to look at the timeline.
-    I'm grouping the data by month to see how active each community has been over time.
-    """
-    # I need the published dates from the snippets file
+    """Group entity mentions by month to track temporal trends per community."""
+    
+    # Join with published dates from snippets
     df_snip_small = df_snip[["snippet_id", "published"]].copy()
     df = df_kpi_comm.merge(df_snip_small, how="left", on="snippet_id")
 
-    # Let's make sure the dates are actual datetime objects so we can work with them
+    # Convert to datetime and extract year-month
     df["published_dt"] = pd.to_datetime(df["published"], errors="coerce")
     df["year_month"] = df["published_dt"].dt.to_period("M").astype(str)
 
-    # Counting entity mentions per community for each month
+    # Count entity mentions per community per month
     df_ent = df[df["category"] == "Entity"].copy()
     temporal = (
         df_ent.groupby(["community_id", "year_month"], as_index=False)
@@ -96,10 +89,7 @@ def compute_community_temporal(df_kpi_comm: pd.DataFrame, df_snip: pd.DataFrame)
 
 
 def compute_forecast(temporal: pd.DataFrame) -> pd.DataFrame:
-    """
-    Predicting the future! (Or at least the next month).
-    I'm using a simple linear regression on the monthly mention counts for each community.
-    """
+    """Generate forecast for next month's mentions using linear regression."""
     forecasts = []
     
     if temporal.empty:
@@ -161,12 +151,8 @@ def compute_ranking(ent_agg: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.Data
     W_STANCE = 5.0   # Stance is -1 to 1, so we boost its impact
     W_GROWTH = 10.0  # Growth slope is usually small, boost it
 
-    # Calculate Score
-    # We normalize stance from [-1, 1] to [0, 1] for scoring? 
-    # Actually, let's keep it raw. A negative stance should hurt the score if we are looking for "Hot & Good" startups.
-    # But "Hot & Bad" (scandals) are also trends. 
-    # Let's assume "Trend Score" implies magnitude of interest + positive sentiment.
-    
+    # Calculate composite score
+    # Keep raw stance values: negative stance reduces score
     merged["score"] = (
         (merged["mentions"] * W_MENTIONS) + 
         (merged["avg_stance"] * W_STANCE) + 

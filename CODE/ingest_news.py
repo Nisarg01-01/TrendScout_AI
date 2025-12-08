@@ -6,10 +6,8 @@ import os
 import config
 
 def parse_feed(url: str):
-    """
-    I'm going to grab the RSS feed from the URL and turn it into a list of articles.
-    I'll also do a quick check to make sure the articles are actually about AI.
-    """
+    """Parse RSS feed and filter for AI-related articles."""
+    
     try:
         parsed = feedparser.parse(url)
         articles = []
@@ -22,8 +20,7 @@ def parse_feed(url: str):
             soup = BeautifulSoup(summary_html, "html.parser")
             text = soup.get_text(" ", strip=True)
             
-            # If the feed is already specific to AI (like an OpenAI blog), I'll trust it.
-            # Otherwise, I'll scan the text for our keywords to make sure it's relevant.
+            # Trust AI-specific feeds, otherwise filter by keywords
             is_ai_feed = "artificial-intelligence" in url or "ai" in url.split('/')[-2:] or "openai" in url
             
             combined = (title + " " + text).lower()
@@ -47,10 +44,8 @@ def parse_feed(url: str):
         return []
 
 def fetch_all_feeds():
-    """
-    I'm looping through all the news sources we set up in the config file.
-    I'll gather everything into one big list.
-    """
+    """Fetch and combine articles from all configured news feeds."""
+    
     all_articles = []
     for url in config.FEEDS:
         print(f"Fetching {url}...")
@@ -59,10 +54,8 @@ def fetch_all_feeds():
     return pd.DataFrame(all_articles)
 
 def save_articles(new_df: pd.DataFrame):
-    """
-    I'll save the new articles to our storage file.
-    But first, I'll check if we already have them so we don't store duplicates.
-    """
+    """Save new articles to storage, deduplicating against existing data."""
+    
     if new_df.empty:
         print("No new articles found.")
         return
@@ -71,8 +64,7 @@ def save_articles(new_df: pd.DataFrame):
     
     if os.path.exists(config.ARTICLES_FILE):
         existing_df = pd.read_parquet(config.ARTICLES_FILE)
-        # Deduplicate against existing data
-        # We use 'link' as the unique identifier
+        # Deduplicate using 'link' as unique identifier
         existing_links = set(existing_df["link"])
         initial_count = len(new_df)
         new_df = new_df[~new_df["link"].isin(existing_links)]

@@ -16,16 +16,14 @@ def get_backend():
 backend = get_backend()
 
 def render_content(content):
-    """
-    I'm taking the raw answer from the LLM and making it look good.
-    If there are any CSV tables hidden in the text, I'll turn them into nice interactive dataframes.
-    """
-    # I'll chop the text up wherever I see the <csv_table> tags.
+    """Render LLM response with embedded CSV tables as interactive dataframes."""
+    
+    # Split content by CSV table tags
     parts = re.split(r'(<csv_table>[\s\S]*?</csv_table>)', content)
     
     for part in parts:
         if "<csv_table>" in part:
-            # Found a table! Let's clean up the tags and show it.
+            # Extract and render table
             csv_content = part.replace("<csv_table>", "").replace("</csv_table>", "").strip()
             try:
                 df = pd.read_csv(StringIO(csv_content))
@@ -34,7 +32,7 @@ def render_content(content):
                 st.error(f"Could not render table: {e}")
                 st.code(csv_content, language="csv")
         else:
-            # Just regular text here.
+            # Render regular markdown content
             if part.strip():
                 st.markdown(part)
 
@@ -53,37 +51,33 @@ with st.sidebar:
     st.markdown("- The Verge")
     st.markdown("- GitHub Jobs")
 
-# I need to remember what we've talked about, so I'll initialize the chat history if it's empty.
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Let's show the previous messages so the user doesn't feel like they're talking to a wall.
+# Display previous messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         render_content(message["content"])
 
-# Waiting for the user to say something...
+# Handle user input
 if prompt := st.chat_input("Ask about market trends, competitors, or SWOT analysis..."):
-    # User Message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Now it's my turn. I'll think for a second (show a spinner) and then give the answer.
+    # Generate and display response
     with st.chat_message("assistant"):
         with st.spinner("Analyzing market data..."):
             try:
-                # I'm calling the backend to do the heavy lifting (search, graph, LLM).
+                # Call backend retrieval and generation pipeline
                 result = backend.generate_answer(prompt, return_context=True)
                 answer = result["answer"]
                 
-                # Time to show the result!
                 render_content(answer)
-                
-                # I'll save what I said so it shows up next time.
                 st.session_state.messages.append({"role": "assistant", "content": answer})
                 
-                # For the curious users, I'll hide the raw data inside an expander.
+                # Show analysis context in expandable section
                 with st.expander("🔍 View Analysis Context"):
                     st.markdown(f"**Detected Entity:** `{result['entity_detected']}`")
                     st.markdown(f"**Intent:** `{result.get('intent', 'General')}`")

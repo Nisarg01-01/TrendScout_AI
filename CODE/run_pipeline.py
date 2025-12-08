@@ -11,7 +11,8 @@ FILES_TO_DELETE = [
     config.SNIPPETS_FILE,
     config.KPI_ENTITIES_FILE,
     config.ENTITY_MAP_FILE,
-    os.path.join(config.DATA_DIR, "snippets_embeddings.parquet")
+    os.path.join(config.DATA_DIR, "snippets_embeddings.parquet"),
+    os.path.join(config.BASE_DIR, "data_bootstrap", "techcrunch_2025_bootstrap.parquet") # Add bootstrap artifact
 ]
 
 # Sequence of scripts to execute for the pipeline
@@ -21,9 +22,13 @@ PIPELINE_STEPS = [
     "preprocess.py",
     "extract_llm.py",
     "dedupe_entities.py",
-    "graph_build.py",
-    "analysis_article_communities.py",
+    "graph_build.py",              # Creates nodes + weighted Article-Article CO_LINK edges
+    "analysis_article_communities.py",  # Louvain clustering + stores :Cluster nodes in Neo4j
+    "kpi_clustering.py",           # NEW: Creates KPI Graph (Gᵏ) layer with HDBSCAN clustering
+    "investor_extraction.py",      # NEW: Extracts investors from funding KPIs, assigns prestige scores
+    "temporal_features.py",        # NEW: Calculates rolling window features (30/90/180 days)
     "analysis_community_swot_summary.py",
+    "ranking_engine.py",           # Computes PageRank + composite scores with investor quality
     "rag_index.py",
     "load_chroma.py"
 ]
@@ -86,6 +91,11 @@ if __name__ == "__main__":
         action='store_true',
         help="Run the bootstrap scripts to seed the system with historical data."
     )
+    parser.add_argument(
+        '--steps',
+        nargs='+',
+        help="Run only specific scripts from the pipeline in the provided order."
+    )
     args = parser.parse_args()
 
     if args.clean:
@@ -93,7 +103,10 @@ if __name__ == "__main__":
 
     print("🚀🚀🚀 STARTING DATA PIPELINE 🚀🚀🚀")
     
-    steps_to_run = PIPELINE_STEPS.copy()
+    if args.steps:
+        steps_to_run = args.steps
+    else:
+        steps_to_run = PIPELINE_STEPS.copy()
     
     if args.bootstrap:
         print("ℹ️ Bootstrap mode enabled. Injecting bootstrap steps.")

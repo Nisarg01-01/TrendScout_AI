@@ -1,5 +1,0 @@
-query,faithfulness,relevance,formatting,reasoning
-What are the threats to AI startups?,5,5,5,"The answer is fully supported by the provided context, which mentions threats to AI startups such as regulatory scrutiny, competition from established players, dependence on key individuals, intense hype and leaks, and cybersecurity threats. The answer directly addresses the user's query and uses a well-formatted CSV table to present the information."
-Compare OpenAI and Google in terms of AI dominance.,5,4,5,"The answer is derived purely from the context and directly addresses the user's query, providing a comparison of OpenAI and Google in terms of AI dominance."
-List the top AI startups in Healthcare.,4,3,5,"The answer is mostly faithful to the context, but introduces new startups (DeepMind Health and Aptivio) not mentioned in the query. The formatting of the output is well-done."
-What is the sentiment around OpenAI?,5,4,3,"The response is faithful to the context and relevant to the query, but it uses Markdown formatting instead of CSV. The answer correctly captures the mixed sentiment around OpenAI mentioned in various articles and sources."

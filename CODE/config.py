@@ -1,12 +1,11 @@
 import os
 from dotenv import load_dotenv
 
-# Load .env
 load_dotenv()
 
 # Paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "DATA")
 ARTICLES_FILE = os.path.join(DATA_DIR, "articles_raw.parquet")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs_raw.parquet")
 SNIPPETS_FILE = os.path.join(DATA_DIR, "snippets.parquet")
@@ -22,11 +21,6 @@ FEEDS = [
     "https://www.wired.com/feed/rss",
     "https://news.crunchbase.com/feed/",
     "https://tldr.tech/ai/feed",
-    "https://openai.com/blog/rss.xml",
-    "https://blogs.microsoft.com/ai/feed/",
-    "https://blog.google/technology/ai/rss/",
-    "https://www.technologyreview.com/topic/artificial-intelligence/feed",
-    "https://www.artificialintelligence-news.com/feed/",
 ]
 
 # Keywords for Filtering
@@ -52,8 +46,7 @@ CHUNK_OVERLAP = 50
 
 # LLM Configuration
 LLM_PROVIDER = "ollama"
-LLM_MODEL = "llama3.1"  # Switched to llama3.1 (8B) for better accuracy. Run `ollama pull llama3.1`
-
+LLM_MODEL = "llama3.1"
 
 # Entity Deduplication
 FUZZY_THRESHOLD = 90

@@ -18,3 +18,5 @@ PyDrive2
 sqlalchemy
 schedule
 chromadb
+sentence-transformers
+hdbscan

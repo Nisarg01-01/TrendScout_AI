@@ -20,7 +20,7 @@ BASE_URL = "https://techcrunch.com/2025/page/{page}/"
 # For now this script lives under data_bootstrap/ in source control.
 # We keep MAX_PAGES small by default so initial runs are cheap; you can
 # increase up to ~225 when ready for a full-year import.
-MAX_PAGES = 15
+MAX_PAGES = 2
 
 # Categories we consider relevant even before keyword filtering
 RELEVANT_CATEGORIES = {
@@ -30,6 +30,13 @@ RELEVANT_CATEGORIES = {
     "fintech",
     "enterprise",
     "biotech-health",
+    "robotics",
+    "natural-language-processing",
+    "machine-learning",
+    "cybersecurity",
+    "cloud",
+    "generative-ai",
+
 }
 
 

@@ -1,5 +1,0 @@
-Query,F1 Score,Semantic Similarity,Faithfulness (1-5),Relevance (1-5)
-What are the threats to AI startups?,0.3877068557919621,0.7317150774281327,4,5
-Compare OpenAI and Google in terms of AI dominance.,0.4208860759493671,0.8136410385141434,4,5
-List the top AI startups in Healthcare.,0.1381074168797954,0.5607357094752985,4,5
-What is the sentiment around OpenAI?,0.36923076923076914,0.7828129049672865,3,4

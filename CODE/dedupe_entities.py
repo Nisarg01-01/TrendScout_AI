@@ -33,14 +33,9 @@ def deduplicate_entities():
     raw_names = entities_df["entity_name"].dropna().unique().tolist()
     print(f"Found {len(raw_names)} unique raw entity names.")
 
-    # Create a mapping: Raw Name -> Canonical Name
-    # Strategy:
-    # 1. Sort by length (prefer shorter, cleaner names as canonical? Or longer? 
-    #    Actually, usually the most frequent one is best, but let's stick to a simple clustering).
-    # 2. Iterate and merge.
-    
-    # Let's use a simple greedy clustering
-    # Sort by frequency to pick the "most common" version as the canonical one
+    # Create mapping: Raw Name -> Canonical Name
+    # Use greedy clustering approach with fuzzy matching
+    # Sort by frequency to use most common version as canonical
     name_counts = entities_df["entity_name"].value_counts()
     sorted_names = name_counts.index.tolist()
     
