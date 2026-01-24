@@ -1,6 +1,8 @@
 feedparser
 beautifulsoup4
+requests
 pandas
+python-dateutil
 pyarrow
 tqdm
 python-dotenv
@@ -18,3 +20,7 @@ PyDrive2
 sqlalchemy
 schedule
 chromadb
+sentence-transformers
+hdbscan
+rapidfuzz
+scikit-learn
