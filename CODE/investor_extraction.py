@@ -65,7 +65,7 @@ class InvestorExtractor:
         
         kpi_file = os.path.join(config.DATA_DIR, "kpi_entities.parquet")
         if not os.path.exists(kpi_file):
-            print("⚠️ No KPI data found")
+            print("[WARN] No KPI data found")
             return []
         
         df_kpi = pd.read_parquet(kpi_file)
@@ -77,7 +77,7 @@ class InvestorExtractor:
         ].copy()
         
         if 'kpi_investors' not in df_funding.columns:
-            print("⚠️ No structured investor data found")
+            print("[WARN] No structured investor data found")
             return []
         
         investors_data = []
@@ -102,7 +102,7 @@ class InvestorExtractor:
             except:
                 pass
         
-        print(f"✅ Extracted {len(investors_data)} investor mentions")
+        print(f"[OK] Extracted {len(investors_data)} investor mentions")
         return investors_data
     
     def _get_investor_prestige(self, investor_name: str) -> float:
@@ -149,7 +149,7 @@ class InvestorExtractor:
                     i.mention_count = inv.mention_count
             """, {'investors': investors_list})
         
-        print(f"✅ Created {len(investors_unique)} Investor nodes")
+        print(f"[OK] Created {len(investors_unique)} Investor nodes")
     
     def link_investors_to_entities(self):
         """Create relationships: Entity-[FUNDED_BY]->Investor."""
@@ -157,16 +157,22 @@ class InvestorExtractor:
         
         kpi_file = os.path.join(config.DATA_DIR, "kpi_entities.parquet")
         df_kpi = pd.read_parquet(kpi_file)
+
+        entity_map = {}
+        if os.path.exists(config.ENTITY_MAP_FILE):
+            df_map = pd.read_parquet(config.ENTITY_MAP_FILE)
+            if not df_map.empty:
+                entity_map = dict(zip(df_map['raw_name'], df_map['canonical_name']))
         
         # Get snippets file for entity mapping
         snippets_file = os.path.join(config.DATA_DIR, "snippets.parquet")
         if not os.path.exists(snippets_file):
-            print("⚠️ Snippets file not found")
+            print("[WARN] Snippets file not found")
             return
         
         df_snippets = pd.read_parquet(snippets_file)
         
-        # Get entity extractions
+        # Get entity extractions (fallback for older extraction files that didn't attach KPIs to entities)
         df_entities = df_kpi[df_kpi['category'] == 'Entity'].copy()
         
         # Get funding KPIs with investors
@@ -191,13 +197,26 @@ class InvestorExtractor:
                 investors = json.loads(investors_json)
             except:
                 continue
-            
-            # Get entities mentioned in same snippet
-            entities_in_snippet = df_entities[df_entities['snippet_id'] == snippet_id]['entity_name'].unique()
-            
-            for entity_name in entities_in_snippet:
+
+            # Prefer the KPI-attached entity if present (more precise than snippet co-occurrence).
+            kpi_entity = funding_row.get('entity_name')
+            kpi_entity = kpi_entity if isinstance(kpi_entity, str) and kpi_entity.strip() else None
+
+            if kpi_entity:
+                target_entities = [kpi_entity]
+            else:
+                # Fallback: entities mentioned in the same snippet (noisy, but keeps backward compatibility).
+                target_entities = list(
+                    df_entities[df_entities['snippet_id'] == snippet_id]['entity_name']
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                )
+
+            for entity_name in target_entities:
                 for investor_name in investors:
                     if entity_name and investor_name:
+                        entity_name = entity_map.get(entity_name, entity_name)
                         relationships.append({
                             'entity': entity_name,
                             'investor': investor_name,
@@ -215,7 +234,7 @@ class InvestorExtractor:
                     ON MATCH SET r.mention_count = r.mention_count + 1
                 """, {'rels': relationships})
             
-            print(f"✅ Created {len(relationships)} FUNDED_BY relationships")
+            print(f"[OK] Created {len(relationships)} FUNDED_BY relationships")
     
     def run_full_pipeline(self):
         """Execute complete investor extraction pipeline."""
@@ -226,7 +245,7 @@ class InvestorExtractor:
         investors_data = self.extract_investors_from_kpis()
         
         if not investors_data:
-            print("⚠️ No investors found in KPI data")
+            print("[WARN] No investors found in KPI data")
             print("   Make sure to run the updated extract_llm.py first")
             return
         
@@ -234,7 +253,7 @@ class InvestorExtractor:
         self.link_investors_to_entities()
         
         print("\n" + "="*80)
-        print("✅ INVESTOR EXTRACTION COMPLETE")
+        print("[OK] INVESTOR EXTRACTION COMPLETE")
         print("="*80 + "\n")
 
 

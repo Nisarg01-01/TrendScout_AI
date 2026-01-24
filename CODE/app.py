@@ -1,12 +1,11 @@
 import streamlit as st
-import time
 import pandas as pd
 import re
 from io import StringIO
 from retrieval_service import TrendScoutBackend
 
 # Page Config
-st.set_page_config(page_title="TrendScout AI", page_icon="📈", layout="wide")
+st.set_page_config(page_title="TrendScout AI", page_icon="TS", layout="wide")
 
 # Initialize Backend
 @st.cache_resource
@@ -37,13 +36,17 @@ def render_content(content):
                 st.markdown(part)
 
 # Title
-st.title("📈 TrendScout AI")
+st.title("TrendScout AI")
 st.markdown("### Market Intelligence & Trend Analysis Agent")
 
 # Sidebar
 with st.sidebar:
     st.header("Configuration")
-    st.info("Connected to Neo4j Aura & Local Vector Store")
+    graph_ok = bool(getattr(getattr(backend, "graph_store", None), "driver", None))
+    vector_ok = getattr(getattr(backend, "vector_store", None), "collection", None) is not None
+    st.write("System status:")
+    st.write(f"- Graph store: {'OK' if graph_ok else 'NOT READY'}")
+    st.write(f"- Vector store: {'OK' if vector_ok else 'NOT READY'}")
     st.markdown("---")
     st.markdown("**Data Sources:**")
     st.markdown("- TechCrunch")
@@ -78,17 +81,17 @@ if prompt := st.chat_input("Ask about market trends, competitors, or SWOT analys
                 st.session_state.messages.append({"role": "assistant", "content": answer})
                 
                 # Show analysis context in expandable section
-                with st.expander("🔍 View Analysis Context"):
+                with st.expander("View Analysis Context"):
                     st.markdown(f"**Detected Entity:** `{result['entity_detected']}`")
                     st.markdown(f"**Intent:** `{result.get('intent', 'General')}`")
                     
-                    st.markdown("### 🕸️ Knowledge Graph Insights")
+                    st.markdown("### Knowledge Graph Insights")
                     if result['graph_context']:
                         st.info(result['graph_context'])
                     else:
                         st.warning("No direct graph connections found for this entity.")
                         
-                    st.markdown("### 📄 Relevant Articles")
+                    st.markdown("### Relevant Articles")
                     for doc in result['vector_context']:
                         st.markdown(f"- **{doc['source']}** ({doc.get('published', 'N/A')}): {doc['text'][:200]}...")
                         

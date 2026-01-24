@@ -6,7 +6,7 @@ Implements cluster-wise startup scoring based on:
 - Recency boost (30-60 day window)
 - Investor quality (optional)
 
-Composite Score = α·Centrality + β·KPI_Stance + γ·Recency + δ·InvestorQuality
+Composite Score = alpha*Centrality + beta*KPI_Stance + gamma*Recency + delta*InvestorQuality
 """
 
 import os
@@ -85,7 +85,7 @@ class StartupRanker:
                 except:
                     cluster_centrality[cid] = {}
         
-        print(f"✅ Computed centrality for {len(cluster_centrality)} clusters")
+        print(f"[OK] Computed centrality for {len(cluster_centrality)} clusters")
         return cluster_centrality
     
     def compute_kpi_stance_scores(self) -> Dict[str, Dict[int, float]]:
@@ -103,8 +103,9 @@ class StartupRanker:
             result = session.run("""
                 MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
                 MATCH (a)<-[:IN]-(s:Snippet)-[:ABOUT]->(k:KPI)
+                MATCH (e)-[:HAS_KPI]->(k)
                 WHERE k.stance IS NOT NULL AND k.date IS NOT NULL
-                RETURN e.name as entity_name, c.id as cluster_id, 
+                RETURN e.name as entity_name, c.id as cluster_id,
                        k.stance as stance, k.date as date
             """)
             
@@ -127,7 +128,7 @@ class StartupRanker:
                     # If date parsing fails, use stance without decay
                     entity_stance[entity][cid] += stance
         
-        print(f"✅ Computed stance scores for {len(entity_stance)} entities")
+        print(f"[OK] Computed stance scores for {len(entity_stance)} entities")
         return dict(entity_stance)
     
     def compute_investor_quality_scores(self) -> Dict[str, Dict[int, float]]:
@@ -163,7 +164,7 @@ class StartupRanker:
                 
                 entity_investor_scores[entity][cid] = score
         
-        print(f"✅ Computed investor scores for {len(entity_investor_scores)} entities")
+        print(f"[OK] Computed investor scores for {len(entity_investor_scores)} entities")
         return dict(entity_investor_scores)
     
     def compute_recency_scores(self) -> Dict[str, Dict[int, float]]:
@@ -199,7 +200,7 @@ class StartupRanker:
                 except:
                     pass
         
-        print(f"✅ Computed recency for {len(entity_recency)} entities")
+        print(f"[OK] Computed recency for {len(entity_recency)} entities")
         return dict(entity_recency)
     
     def compute_composite_scores(self) -> pd.DataFrame:
@@ -207,7 +208,7 @@ class StartupRanker:
         Compute final composite scores for all entities in all clusters.
         Returns DataFrame with columns: entity_name, cluster_id, score, rank
         """
-        print("\n🎯 Computing composite startup scores...")
+        print("\nComputing composite startup scores...")
         
         centrality = self.compute_centrality_per_cluster()
         stance = self.compute_kpi_stance_scores()
@@ -262,7 +263,7 @@ class StartupRanker:
         df['rank'] = df.groupby('cluster_id')['composite_score'].rank(ascending=False, method='dense')
         df = df.sort_values(['cluster_id', 'rank'])
         
-        print(f"\n✅ Computed scores for {len(df)} entity-cluster pairs")
+        print(f"\n[OK] Computed scores for {len(df)} entity-cluster pairs")
         return df
     
     def store_scores_in_neo4j(self, df: pd.DataFrame):
@@ -291,13 +292,13 @@ class StartupRanker:
                     'investor_quality': float(row['investor_quality'])
                 })
         
-        print("✅ Scores stored with :RANKED_IN relationships")
+        print("[OK] Scores stored with :RANKED_IN relationships")
     
     def export_rankings(self, df: pd.DataFrame):
         """Export rankings to parquet file."""
         out_path = os.path.join(config.DATA_DIR, "entity_rankings.parquet")
         df.to_parquet(out_path, index=False)
-        print(f"✅ Saved rankings to {out_path}")
+        print(f"[OK] Saved rankings to {out_path}")
     
     def get_top_entities_in_cluster(self, cluster_id: int, top_k: int = 10) -> pd.DataFrame:
         """Retrieve top-k ranked entities for a specific cluster."""
@@ -336,7 +337,7 @@ def main():
         ranker.store_scores_in_neo4j(df_rankings)
         ranker.export_rankings(df_rankings)
         
-        print("\n✅ Ranking pipeline complete!")
+        print("\n[OK] Ranking pipeline complete!")
         
     finally:
         ranker.close()

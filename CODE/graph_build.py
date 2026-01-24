@@ -8,9 +8,18 @@ import networkx as nx
 from datetime import datetime
 from collections import defaultdict
 import numpy as np
+import hashlib
+import argparse
 
 class GraphBuilder:
     def __init__(self):
+        if not config.NEO4J_URI or str(config.NEO4J_URI).strip() == "":
+            raise ValueError(
+                "NEO4J_URI is missing/blank. Set it in `.env` (repo root) "
+                "to something like `bolt://localhost:7687` or `neo4j+s://<id>.databases.neo4j.io`."
+            )
+        if "://" not in str(config.NEO4J_URI):
+            raise ValueError(f"NEO4J_URI looks invalid: {config.NEO4J_URI!r}")
         self.driver = GraphDatabase.driver(
             config.NEO4J_URI,
             auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD)
@@ -28,6 +37,11 @@ class GraphBuilder:
 
     def close(self):
         self.driver.close()
+
+    def clear_database(self):
+        """Dangerous: deletes all nodes/relationships from the configured Neo4j database."""
+        with self.driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
 
     def create_constraints(self):
         """Create graph database constraints and indexes for unique nodes and performance."""
@@ -112,162 +126,257 @@ class GraphBuilder:
             return
 
         print(f"Building graph from {len(df_kpi)} extraction records and {len(df_snippets)} snippets...")
-        
-        # Index snippets by id for fast lookup
-        snippets_dict = df_snippets.set_index('snippet_id').to_dict('index')
-        
-        # Group extractions by snippet_id
-        grouped = df_kpi.groupby('snippet_id')
-        
+
+        if "article_id" not in df_snippets.columns:
+            raise ValueError("snippets.parquet is missing 'article_id'. Run upgrade_legacy_data.py / preprocess.py first.")
+
+        # Join extractions with snippet metadata so we can build proper Article vs Snippet nodes.
+        meta_cols = [
+            "snippet_id",
+            "article_id",
+            "source",
+            "title",
+            "link",
+            "canonical_url",
+            "published",
+            "chunk_index",
+            "text",
+            "parent_fetched_at",
+        ]
+        meta_cols = [c for c in meta_cols if c in df_snippets.columns]
+        df_join = df_kpi.merge(df_snippets[meta_cols], how="left", on="snippet_id")
+        df_join = df_join[df_join["article_id"].notna()].copy()
+
         # Track entities per article for co-occurrence calculation
-        article_entities = {}  # {article_id: set(entity_names)}
-        article_dates = {}  # {article_id: datetime}
-        
+        article_entities: dict[str, set[str]] = {}
+        article_dates: dict[str, datetime] = {}
+
+        def make_kpi_id(snippet_id: str, kpi_type: str, kpi_value: str, entity_name: str | None) -> str:
+            base = f"{snippet_id}|{kpi_type}|{kpi_value}|{entity_name or ''}"
+            return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
+
         with self.driver.session() as session:
-            count = 0
-            for snippet_id, group in grouped:
-                count += 1
-                if count % 50 == 0:
-                    print(f"Processed {count} articles...")
-                    
-                # Get article metadata from snippets
-                meta = snippets_dict.get(snippet_id, {})
-                title = meta.get('title', 'Unknown Title')
-                source = meta.get('source', 'Unknown Source')
-                link = meta.get('link', '')
-                published = str(meta.get('published', ''))
-                
-                # Determine industry and collect SWOT data
-                industries = group['industry'].dropna().unique()
-                main_industry = industries[0] if len(industries) > 0 else "Unclassified"
-                
-                # Collect SWOT
-                swot_data = {'Strength': [], 'Weakness': [], 'Opportunity': [], 'Threat': []}
-                swot_rows = group[group['category'] == 'SWOT']
-                for _, row in swot_rows.iterrows():
-                    dtype = row['detail_type']
-                    dval = row['detail_value']
-                    if dtype in swot_data and dval:
-                        swot_data[dtype].append(dval)
-                
-                # Prepare article properties for Neo4j
-                article_props = {
-                    'id': snippet_id,
-                    'title': title,
-                    'source': source,
-                    'link': link,
-                    'published': published,
-                    'swot_Strength': swot_data['Strength'],
-                    'swot_Weakness': swot_data['Weakness'],
-                    'swot_Opportunity': swot_data['Opportunity'],
-                    'swot_Threat': swot_data['Threat']
-                }
-                
-                # Create Article and Industry nodes with relationship
-                session.run("""
+            # Build Article and Snippet nodes first.
+            articles = (
+                df_snippets.drop_duplicates("article_id")
+                .sort_values("article_id")
+                .to_dict("records")
+            )
+            for art in articles:
+                article_id = str(art.get("article_id"))
+                if not article_id or article_id == "nan":
+                    continue
+                session.run(
+                    """
                     MERGE (a:Article {id: $id})
                     SET a.title = $title,
                         a.source = $source,
                         a.link = $link,
+                        a.canonical_url = $canonical_url,
                         a.published = $published,
-                        a.swot_Strength = $swot_Strength,
-                        a.swot_Weakness = $swot_Weakness,
-                        a.swot_Opportunity = $swot_Opportunity,
-                        a.swot_Threat = $swot_Threat
-                    
+                        a.fetched_at = $fetched_at
+                    """,
+                    {
+                        "id": article_id,
+                        "title": art.get("title", "Unknown Title"),
+                        "source": art.get("source", "Unknown Source"),
+                        "link": art.get("link", ""),
+                        "canonical_url": art.get("canonical_url", ""),
+                        "published": str(art.get("published", "")),
+                        "fetched_at": str(art.get("parent_fetched_at", "")),
+                    },
+                )
+
+            for _, sn in df_snippets.iterrows():
+                snippet_id = str(sn.get("snippet_id"))
+                article_id = str(sn.get("article_id"))
+                if not snippet_id or snippet_id == "nan" or not article_id or article_id == "nan":
+                    continue
+                chunk_index_raw = sn.get("chunk_index", 0)
+                try:
+                    chunk_index = int(chunk_index_raw)
+                except Exception:
+                    chunk_index = 0
+                session.run(
+                    """
+                    MATCH (a:Article {id: $article_id})
+                    MERGE (sn:Snippet {id: $snippet_id})
+                    SET sn.text = $text,
+                        sn.date = $published,
+                        sn.chunk_index = $chunk_index
+                    MERGE (sn)-[:IN]->(a)
+                    """,
+                    {
+                        "article_id": article_id,
+                        "snippet_id": snippet_id,
+                        "text": sn.get("text", ""),
+                        "published": str(sn.get("published", "")),
+                        "chunk_index": chunk_index,
+                    },
+                )
+
+            # Group by article_id to attach industry + mentions at article level.
+            grouped_articles = df_join.groupby("article_id")
+            processed = 0
+            for article_id, group in grouped_articles:
+                processed += 1
+                if processed % 25 == 0:
+                    print(f"Processed {processed} articles...")
+
+                article_id = str(article_id)
+
+                # Industry per article: prefer non-empty, non-Unknown values
+                industry_vals = (
+                    group.get("industry")
+                    .dropna()
+                    .astype(str)
+                    .map(str.strip)
+                    .loc[lambda s: (s != "") & (s.str.lower() != "unknown") & (s.str.lower() != "unclassified")]
+                )
+                main_industry = industry_vals.mode().iloc[0] if not industry_vals.empty else "Unclassified"
+
+                session.run(
+                    """
+                    MATCH (a:Article {id: $article_id})
                     MERGE (i:Industry {name: $industry})
                     MERGE (a)-[:BELONGS_TO]->(i)
-                """, {**article_props, 'industry': main_industry})
-                
-                # Separate entity mentions from KPIs
-                entity_rows = group[group['category'] == 'Entity']
-                kpi_rows = group[group['category'] == 'KPI']
-                
-                # Prepare entities using canonical name mapping
-                entities_to_batch = []
-                entity_names = set()
-                
-                for _, row in entity_rows.iterrows():
-                    raw_name = row['entity_name']
-                    if not raw_name: continue
-                    
-                    name = entity_map.get(raw_name, raw_name)
-                    etype = row['entity_type'] if row['entity_type'] else 'Unknown'
-                    stance = row['stance']
-                    
-                    entities_to_batch.append({
-                        'name': name,
-                        'type': etype,
-                        'stance': stance
-                    })
-                    entity_names.add(name)
-                
-                # Store entities and date for co-occurrence calculation
-                article_entities[snippet_id] = entity_names
-                try:
-                    article_dates[snippet_id] = datetime.fromisoformat(published.replace('Z', '+00:00')) if published else datetime.now()
-                except:
-                    article_dates[snippet_id] = datetime.now()
-                
-                # Sending the entities to the graph in a batch is much faster than doing them one by one.
-                if entities_to_batch:
-                    session.run("""
-                        MATCH (a:Article {id: $article_id})
-                        UNWIND $entities AS ent
-                        MERGE (e:Entity {name: ent.name})
-                        ON CREATE SET e.type = ent.type
-                        MERGE (a)-[r:MENTIONS]->(e)
-                        SET r.stance = ent.stance
-                    """, {'article_id': snippet_id, 'entities': entities_to_batch})
+                    """,
+                    {"article_id": article_id, "industry": main_industry},
+                )
 
-                # Create KPI nodes and relationships
-                kpis_to_batch = []
+                # Aggregate SWOT per article (stored on Article for UI context).
+                swot_data = {"Strength": [], "Weakness": [], "Opportunity": [], "Threat": []}
+                swot_rows = group[group["category"] == "SWOT"]
+                for _, row in swot_rows.iterrows():
+                    dtype = str(row.get("detail_type", "")).strip()
+                    dval = str(row.get("detail_value", "")).strip()
+                    if dtype in swot_data and dval:
+                        swot_data[dtype].append(dval)
+
+                if any(swot_data.values()):
+                    # Deduplicate while preserving order
+                    for k in swot_data:
+                        seen = set()
+                        deduped = []
+                        for v in swot_data[k]:
+                            if v not in seen:
+                                seen.add(v)
+                                deduped.append(v)
+                        swot_data[k] = deduped
+
+                    session.run(
+                        """
+                        MATCH (a:Article {id: $article_id})
+                        SET a.swot_Strength = $swot_Strength,
+                            a.swot_Weakness = $swot_Weakness,
+                            a.swot_Opportunity = $swot_Opportunity,
+                            a.swot_Threat = $swot_Threat
+                        """,
+                        {
+                            "article_id": article_id,
+                            "swot_Strength": swot_data["Strength"],
+                            "swot_Weakness": swot_data["Weakness"],
+                            "swot_Opportunity": swot_data["Opportunity"],
+                            "swot_Threat": swot_data["Threat"],
+                        },
+                    )
+
+                # Article published date for recency decay in CO_LINK.
+                pub = str(group.get("published").dropna().astype(str).head(1).iloc[0]) if "published" in group.columns and not group.get("published").dropna().empty else ""
+                try:
+                    article_dates[article_id] = datetime.fromisoformat(pub.replace("Z", "+00:00")) if pub else datetime.now()
+                except Exception:
+                    article_dates[article_id] = datetime.now()
+
+                # Entity mentions
+                entity_rows = group[group["category"] == "Entity"].copy()
+                entity_rows = entity_rows[entity_rows["entity_name"].notna()]
+                if not entity_rows.empty:
+                    # Normalize via entity_map and aggregate stance.
+                    entity_rows["entity_name"] = entity_rows["entity_name"].astype(str).map(lambda s: entity_map.get(s, s))
+                    ent_agg = (
+                        entity_rows.groupby(["entity_name"], as_index=False)
+                        .agg(entity_type=("entity_type", "first"), stance=("stance", "mean"))
+                    )
+                    entities_to_batch = []
+                    entity_names_set: set[str] = set()
+                    for _, er in ent_agg.iterrows():
+                        name = str(er.get("entity_name", "")).strip()
+                        if not name:
+                            continue
+                        entities_to_batch.append(
+                            {
+                                "name": name,
+                                "type": str(er.get("entity_type", "") or "Unknown"),
+                                "stance": float(er.get("stance", 0.0) or 0.0),
+                            }
+                        )
+                        entity_names_set.add(name)
+                    article_entities[article_id] = entity_names_set
+
+                    if entities_to_batch:
+                        session.run(
+                            """
+                            MATCH (a:Article {id: $article_id})
+                            UNWIND $entities AS ent
+                            MERGE (e:Entity {name: ent.name})
+                            ON CREATE SET e.type = ent.type
+                            MERGE (a)-[r:MENTIONS]->(e)
+                            SET r.stance = ent.stance
+                            """,
+                            {"article_id": article_id, "entities": entities_to_batch},
+                        )
+
+                # KPI nodes: connect Snippet -> KPI and (when available) Entity -> KPI.
+                kpi_rows = group[group["category"] == "KPI"].copy()
                 for _, row in kpi_rows.iterrows():
-                    k_name = row['detail_type']
-                    k_value = row['detail_value']
-                    if k_name and k_value:
-                        kpis_to_batch.append({'name': k_name, 'value': k_value})
-                        
-                if kpis_to_batch:
-                    session.run("""
-                        MATCH (a:Article {id: $article_id})
-                        UNWIND $kpis AS k
-                        MERGE (m:Metric {name: k.name})
-                        MERGE (a)-[r:REPORTED_METRIC]->(m)
-                        SET r.value = k.value
-                    """, {'article_id': snippet_id, 'kpis': kpis_to_batch})
-                
-                # Create Snippet nodes with KPI stance (for KPI graph Gᵏ)
-                snippets_to_batch = []
-                for idx, row in kpi_rows.iterrows():
-                    kpi_type = row['detail_type']
-                    kpi_value = row['detail_value']
-                    # Determine stance/polarity from context
-                    stance_value = self._determine_kpi_stance(kpi_type, kpi_value)
-                    
-                    if kpi_type and kpi_value:
-                        # Create a unique ID for the KPI node - use row index to ensure uniqueness
-                        kpi_node_id = f"{snippet_id}_{kpi_type}_{idx}"
-                        snippets_to_batch.append({
-                            'id': snippet_id, # This is the Snippet ID
-                            'text': kpi_value,
-                            'date': published,
-                            'kpi': {'id': kpi_node_id, 'type': kpi_type},
-                            'stance': stance_value
-                        })
-                
-                if snippets_to_batch:
-                    session.run("""
-                        MATCH (a:Article {id: $article_id})
-                        UNWIND $snippets AS s
-                        MERGE (sn:Snippet {id: s.id}) // Use the actual snippet_id
-                        SET sn.text = s.text, sn.date = s.date
-                        MERGE (sn)-[:IN]->(a)
-                        
-                        MERGE (k:KPI {id: s.kpi.id})
-                        SET k.type = s.kpi.type, k.stance = s.stance, k.date = s.date
+                    snippet_id = str(row.get("snippet_id", ""))
+                    if not snippet_id or snippet_id == "nan":
+                        continue
+                    kpi_type = str(row.get("detail_type", "")).strip()
+                    kpi_value = str(row.get("detail_value", "")).strip()
+                    if not kpi_type or not kpi_value:
+                        continue
+
+                    entity_name = row.get("entity_name")
+                    entity_name = str(entity_name).strip() if isinstance(entity_name, str) and entity_name.strip() else None
+                    if entity_name:
+                        entity_name = entity_map.get(entity_name, entity_name)
+
+                    kpi_id = make_kpi_id(snippet_id, kpi_type, kpi_value, entity_name)
+                    stance_val = float(row.get("stance", 0.0) or 0.0)
+                    conf_val = float(row.get("confidence", 1.0) or 1.0)
+
+                    session.run(
+                        """
+                        MATCH (sn:Snippet {id: $snippet_id})-[:IN]->(a:Article)
+                        MERGE (k:KPI {id: $kpi_id})
+                        SET k.type = $kpi_type,
+                            k.value = $kpi_value,
+                            k.stance = $stance,
+                            k.confidence = $confidence,
+                            k.date = sn.date
                         MERGE (sn)-[:ABOUT]->(k)
-                    """, {'article_id': snippet_id, 'snippets': snippets_to_batch})
+                        """,
+                        {
+                            "snippet_id": snippet_id,
+                            "kpi_id": kpi_id,
+                            "kpi_type": kpi_type,
+                            "kpi_value": kpi_value,
+                            "stance": stance_val,
+                            "confidence": conf_val,
+                        },
+                    )
+
+                    if entity_name:
+                        session.run(
+                            """
+                            MATCH (e:Entity {name: $entity_name})
+                            MATCH (k:KPI {id: $kpi_id})
+                            MERGE (e)-[:HAS_KPI]->(k)
+                            """,
+                            {"entity_name": entity_name, "kpi_id": kpi_id},
+                        )
 
         print("Graph build phase 1 complete. Now creating Article-Article edges...")
         self._create_article_colinks(article_entities, article_dates)
@@ -367,11 +476,22 @@ class GraphBuilder:
                 if i % 1000 == 0 and i > 0:
                     print(f"  Created {i} edges...")
         
-        print(f"✅ Created {len(edges_to_create)} weighted Article-Article edges")
+        print(f"[OK] Created {len(edges_to_create)} weighted Article-Article edges")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Build TrendScout knowledge graph in Neo4j.")
+    parser.add_argument("--reset", action="store_true", help="Delete ALL nodes/relationships in Neo4j before building.")
+    parser.add_argument("--yes", action="store_true", help="Required confirmation flag when using --reset.")
+    args = parser.parse_args()
+
     builder = GraphBuilder()
     try:
+        if args.reset:
+            if not args.yes:
+                raise SystemExit("Refusing to reset Neo4j without --yes. Example: python CODE/graph_build.py --reset --yes")
+            print("[WARN] Resetting Neo4j database (MATCH (n) DETACH DELETE n)...")
+            builder.clear_database()
+
         builder.create_constraints()
         builder.build_graph()
     finally:

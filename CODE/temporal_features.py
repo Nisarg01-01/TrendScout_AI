@@ -38,8 +38,7 @@ class TemporalFeatureEngine:
         Calculate funding metrics in given time window.
         Returns: count, total_amount, average_amount, stages
         """
-        cutoff = datetime.now() - timedelta(days=window_days)
-        cutoff_str = cutoff.isoformat()
+        cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=window_days)
         
         with self.driver.session() as session:
             # Get snippet IDs related to the entity
@@ -47,7 +46,7 @@ class TemporalFeatureEngine:
                 MATCH (a:Article)-[:MENTIONS]->(e:Entity {name: $entity_name})
                 MATCH (a)<-[:IN]-(s:Snippet)
                 RETURN s.id as snippet_id
-            """, {'entity_name': entity_name, 'cutoff': cutoff_str})
+            """, {'entity_name': entity_name})
             
             # Get a set of relevant snippet IDs for this entity
             relevant_snippet_ids = {record['snippet_id'] for record in result}
@@ -74,9 +73,13 @@ class TemporalFeatureEngine:
         
         if 'kpi_amount' in df_funding.columns:
             # Convert date strings to datetime objects for filtering
-            df_funding['date'] = pd.to_datetime(df_funding['detail_value'].str.extract(r'(\d{4}-\d{2}-\d{2})')[0], errors='coerce')
-            funding_in_window = df_funding[df_funding['date'] >= cutoff_str]
-            funding_in_window = df_funding[df_funding['kpi_amount'] > 0]
+            df_funding['date'] = pd.to_datetime(
+                df_funding['detail_value'].str.extract(r'(\d{4}-\d{2}-\d{2})')[0],
+                errors='coerce',
+                utc=True
+            )
+            funding_in_window = df_funding[df_funding['date'] >= cutoff]
+            funding_in_window = funding_in_window[funding_in_window['kpi_amount'] > 0]
             
             count = len(funding_in_window)
             total_amount = funding_in_window['kpi_amount'].sum()
@@ -105,8 +108,7 @@ class TemporalFeatureEngine:
         Calculate hiring metrics in given time window.
         Returns: total_count, unique_roles, unique_skills
         """
-        cutoff = datetime.now() - timedelta(days=window_days)
-        cutoff_str = cutoff.isoformat()
+        cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=window_days)
         
         # Get snippet IDs related to the entity from Neo4j
         relevant_snippet_ids = set()
@@ -116,7 +118,7 @@ class TemporalFeatureEngine:
                 MATCH (a:Article)-[:MENTIONS]->(e:Entity {name: $entity_name})
                 MATCH (a)<-[:IN]-(s:Snippet)
                 RETURN s.id as snippet_id
-            """, {'entity_name': entity_name, 'cutoff': cutoff_str})
+            """, {'entity_name': entity_name})
             
             # Get a set of relevant snippet IDs for this entity
             relevant_snippet_ids = {record['snippet_id'] for record in result}
@@ -148,8 +150,12 @@ class TemporalFeatureEngine:
             }
         
         # Filter by date window
-        df_hiring['date'] = pd.to_datetime(df_hiring['detail_value'].str.extract(r'(\d{4}-\d{2}-\d{2})')[0], errors='coerce')
-        df_hiring = df_hiring[df_hiring['date'] >= cutoff_str]
+        df_hiring['date'] = pd.to_datetime(
+            df_hiring['detail_value'].str.extract(r'(\d{4}-\d{2}-\d{2})')[0],
+            errors='coerce',
+            utc=True
+        )
+        df_hiring = df_hiring[df_hiring['date'] >= cutoff]
 
         total_count = int(df_hiring['kpi_count'].sum())
         
@@ -321,8 +327,8 @@ class TemporalFeatureEngine:
         out_path = os.path.join(config.DATA_DIR, "temporal_features.parquet")
         df.to_parquet(out_path, index=False)
         
-        print(f"\n✅ Computed {len(df)} feature rows")
-        print(f"✅ Saved to {out_path}")
+        print(f"\n[OK] Computed {len(df)} feature rows")
+        print(f"[OK] Saved to {out_path}")
         
         # Show sample
         print("\n--- Sample Features ---")
@@ -339,7 +345,7 @@ def main():
     engine = TemporalFeatureEngine()
     try:
         df_features = engine.compute_all_features()
-        print(f"✅ Temporal feature extraction complete: {len(df_features)} entities")
+        print(f"[OK] Temporal feature extraction complete: {len(df_features)} entities")
     finally:
         engine.close()
 

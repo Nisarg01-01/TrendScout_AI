@@ -1,5 +1,5 @@
 """
-KPI Clustering Module - Implements Gᵏ (KPI Graph) layer
+KPI Clustering Module - Implements G_k (KPI Graph) layer
 Clusters snippets within each article cluster using HDBSCAN on embeddings
 Creates :KPICluster nodes and relationships in Neo4j
 """
@@ -51,7 +51,7 @@ class KPIClusterer:
                     'date': record['date']
                 })
         
-        print(f"✅ Loaded snippets from {len(snippets_by_cluster)} article clusters")
+        print(f"[OK] Loaded snippets from {len(snippets_by_cluster)} article clusters")
         return snippets_by_cluster
     
     def cluster_snippets_in_article_cluster(self, cluster_id: int, snippets: List[Dict]) -> List[int]:
@@ -164,14 +164,14 @@ class KPIClusterer:
     def run_full_pipeline(self):
         """Execute complete KPI clustering pipeline."""
         print("\n" + "="*80)
-        print("STARTING KPI CLUSTERING PIPELINE (Gᵏ)")
+        print("STARTING KPI CLUSTERING PIPELINE (G_k)")
         print("="*80 + "\n")
         
         # Get snippets grouped by article cluster
         snippets_by_cluster = self.get_snippets_per_article_cluster()
         
         if not snippets_by_cluster:
-            print("⚠️ No snippets found in graph. Run graph_build.py first.")
+            print("[WARN] No snippets found in graph. Run graph_build.py first.")
             return
         
         total_kpi_clusters = 0
@@ -183,20 +183,20 @@ class KPIClusterer:
             # Create similarity edges
             edge_count = self.create_snippet_similarity_edges(article_cluster_id, snippets)
             total_edges += edge_count
-            print(f"  ✅ Created {edge_count} Snippet-Snippet similarity edges")
+            print(f"  [OK] Created {edge_count} Snippet-Snippet similarity edges")
             
             # Cluster snippets
             kpi_labels, n_kpi_clusters = self.cluster_snippets_in_article_cluster(article_cluster_id, snippets)
-            print(f"  ✅ Detected {n_kpi_clusters} KPI clusters (HDBSCAN)")
+            print(f"  [OK] Detected {n_kpi_clusters} KPI clusters (HDBSCAN)")
             
             # Store in Neo4j
             self.store_kpi_clusters(article_cluster_id, snippets, kpi_labels)
-            print(f"  ✅ Stored KPI cluster assignments")
+            print(f"  [OK] Stored KPI cluster assignments")
             
             total_kpi_clusters += n_kpi_clusters
         
         print("\n" + "="*80)
-        print(f"✅ KPI CLUSTERING COMPLETE")
+        print(f"[OK] KPI CLUSTERING COMPLETE")
         print(f"   Article Clusters: {len(snippets_by_cluster)}")
         print(f"   Total KPI Clusters: {total_kpi_clusters}")
         print(f"   Snippet-Snippet Edges: {total_edges}")
@@ -230,7 +230,7 @@ class KPIClusterer:
             df = pd.DataFrame(rows)
             out_path = os.path.join(config.DATA_DIR, "kpi_clusters.parquet")
             df.to_parquet(out_path, index=False)
-            print(f"✅ Saved KPI cluster summary to {out_path}")
+            print(f"[OK] Saved KPI cluster summary to {out_path}")
 
 
 def main():

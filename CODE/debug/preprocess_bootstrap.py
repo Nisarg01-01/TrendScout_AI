@@ -1,6 +1,5 @@
 import os
 import sys
-import uuid
 from datetime import datetime
 
 import pandas as pd
@@ -11,13 +10,14 @@ if ROOT_DIR not in sys.path:
 
 import config
 from preprocess import clean_text, chunk_text
+from utils.id_utils import make_article_id, make_snippet_id
 
 
 BOOTSTRAP_FILE = os.path.join(ROOT_DIR, "data_bootstrap", "techcrunch_2025_bootstrap.parquet")
 
 
 def normalize_published(raw: str) -> str:
-    """Best-effort normalization of TechCrunch date_hint → ISO date string.
+    """Best-effort normalization of TechCrunch date_hint -> ISO date string.
 
     The bootstrap file stores a loose "date_hint" string; here we try to
     parse it so temporal analysis downstream is on a clean timeline.
@@ -66,11 +66,21 @@ def snippets_from_bootstrap(df: pd.DataFrame) -> pd.DataFrame:
         if not text:
             continue
 
+        article_id = make_article_id(
+            row.get("url", ""),
+            row.get("source", "TechCrunch"),
+            row.get("title", ""),
+            row.get("published_norm") or row.get("published", "")
+        )
+        if not article_id:
+            continue
+
         chunks = chunk_text(text, chunk_size=config.CHUNK_SIZE, overlap=config.CHUNK_OVERLAP)
         for idx, chunk in enumerate(chunks):
             records.append(
                 {
-                    "snippet_id": str(uuid.uuid4()),
+                    "snippet_id": make_snippet_id(article_id, idx),
+                    "article_id": article_id,
                     "source": row.get("source", "TechCrunch"),
                     "title": row.get("title", ""),
                     "link": row.get("url", ""),

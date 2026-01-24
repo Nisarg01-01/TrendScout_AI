@@ -24,8 +24,7 @@ def load_parquet_to_chroma():
         return
 
     # Initialize ChromaDB
-    chroma_dir = os.path.join(os.getcwd(), "chroma_db")
-    client = chromadb.PersistentClient(path=chroma_dir)
+    client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
     
     # Delete existing collection if we want a fresh start (optional, but good for consistency)
     try:
@@ -75,7 +74,7 @@ def load_parquet_to_chroma():
             metadatas=metadatas
         )
 
-    print(f"Successfully loaded {len(df)} snippets into ChromaDB at {chroma_dir}")
+    print(f"Successfully loaded {len(df)} snippets into ChromaDB at {config.CHROMA_DB_PATH}")
 
 if __name__ == "__main__":
     load_parquet_to_chroma()

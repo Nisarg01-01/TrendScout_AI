@@ -2,7 +2,6 @@ import os
 import subprocess
 import argparse
 import sys
-from utils.neo4j_utils import get_neo4j_driver, clear_database
 import config
 
 # List of files to be deleted for a clean run
@@ -24,7 +23,7 @@ PIPELINE_STEPS = [
     "dedupe_entities.py",
     "graph_build.py",              # Creates nodes + weighted Article-Article CO_LINK edges
     "analysis_article_communities.py",  # Louvain clustering + stores :Cluster nodes in Neo4j
-    "kpi_clustering.py",           # NEW: Creates KPI Graph (Gᵏ) layer with HDBSCAN clustering
+    "kpi_clustering.py",           # NEW: Creates KPI Graph (G_k) layer with HDBSCAN clustering
     "investor_extraction.py",      # NEW: Extracts investors from funding KPIs, assigns prestige scores
     "temporal_features.py",        # NEW: Calculates rolling window features (30/90/180 days)
     "analysis_community_swot_summary.py",
@@ -38,12 +37,22 @@ BOOTSTRAP_STEPS = [
     "debug/preprocess_bootstrap.py"
 ]
 
+def resolve_script_path(script_name: str) -> str:
+    """Resolve script path for pipeline steps."""
+    if os.path.isabs(script_name):
+        return script_name
+    if os.path.exists(script_name):
+        return script_name
+    return os.path.join(config.CODE_DIR, script_name)
+
+
 def run_script(script_name):
     """Executes a python script and checks for errors."""
-    print(f"\n{'='*20} Running: {script_name} {'='*20}")
+    script_path = resolve_script_path(script_name)
+    print(f"\n{'='*20} Running: {script_path} {'='*20}")
     try:
         # Using sys.executable to ensure we use the same python interpreter
-        result = subprocess.run([sys.executable, script_name], check=True, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, script_path], check=True, capture_output=True, text=True)
         print(result.stdout)
         if result.stderr:
             print("--- Stderr ---")
@@ -69,6 +78,7 @@ def clean_workspace():
             
     # Clear Neo4j Database
     try:
+        from utils.neo4j_utils import get_neo4j_driver, clear_database
         driver = get_neo4j_driver()
         clear_database(driver)
         driver.close()
@@ -81,6 +91,11 @@ def clean_workspace():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the TrendScout AI data pipeline.")
+    parser.add_argument(
+        '--doctor',
+        action='store_true',
+        help="Run environment checks (dependencies, config, services) and exit."
+    )
     parser.add_argument(
         '--clean',
         action='store_true',
@@ -98,10 +113,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.doctor:
+        run_script("doctor.py")
+        raise SystemExit(0)
+
     if args.clean:
         clean_workspace()
 
-    print("🚀🚀🚀 STARTING DATA PIPELINE 🚀🚀🚀")
+    print("=== STARTING DATA PIPELINE ===")
     
     if args.steps:
         steps_to_run = args.steps
@@ -109,7 +128,7 @@ if __name__ == "__main__":
         steps_to_run = PIPELINE_STEPS.copy()
     
     if args.bootstrap:
-        print("ℹ️ Bootstrap mode enabled. Injecting bootstrap steps.")
+        print("Bootstrap mode enabled. Injecting bootstrap steps.")
         # Insert bootstrap steps after ingestion (index 2) but before preprocessing
         # Current list: ingest_news, ingest_jobs, preprocess...
         # We want: ingest_news, ingest_jobs, bootstrap..., preprocess...
@@ -120,4 +139,4 @@ if __name__ == "__main__":
 
     for step in steps_to_run:
         run_script(step)
-    print("✅✅✅ PIPELINE COMPLETED SUCCESSFULLY ✅✅✅")
+    print("=== PIPELINE COMPLETED SUCCESSFULLY ===")

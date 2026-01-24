@@ -34,7 +34,21 @@ def load_data() -> Dict[str, pd.DataFrame]:
 def enrich_with_community(df_kpi: pd.DataFrame, df_comm: pd.DataFrame) -> pd.DataFrame:
     """Join KPI data with community IDs, filtering out unassigned articles."""
     
-    merged = df_kpi.merge(df_comm, how="left", on="snippet_id")
+    if "article_id" not in df_comm.columns:
+        raise ValueError("article_communities.parquet must contain 'article_id'. Re-run analysis_article_communities.py.")
+
+    if "article_id" not in df_kpi.columns:
+        # Map snippet -> article, then join communities by article_id.
+        if os.path.exists(config.SNIPPETS_FILE):
+            df_snip = pd.read_parquet(config.SNIPPETS_FILE, columns=["snippet_id", "article_id"])
+            merged = df_kpi.merge(df_snip, how="left", on="snippet_id")
+        else:
+            merged = df_kpi.copy()
+            merged["article_id"] = None
+    else:
+        merged = df_kpi.copy()
+
+    merged = merged.merge(df_comm, how="left", on="article_id")
     # Drop articles not assigned to any community
     merged = merged[merged["community_id"].notna()].copy()
     return merged
@@ -132,7 +146,7 @@ def compute_forecast(temporal: pd.DataFrame) -> pd.DataFrame:
 def compute_ranking(ent_agg: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
     """
     The Grand Ranking Algorithm.
-    Score = α·centrality + β·(pos−neg) + γ·recency + ε·community_growth
+    Score = alpha*centrality + beta*(pos-neg) + gamma*recency + epsilon*community_growth
     
     Here:
     - Centrality/Popularity = 'mentions'

@@ -1,13 +1,24 @@
 import os
 import pandas as pd
 import numpy as np
-import ollama
-from neo4j import GraphDatabase
 import config
 from typing import List, Dict, Any
 import json
 from datetime import datetime
-import chromadb
+try:
+    import ollama  # type: ignore
+except ModuleNotFoundError:
+    ollama = None
+
+try:
+    from neo4j import GraphDatabase  # type: ignore
+except ModuleNotFoundError:
+    GraphDatabase = None
+
+try:
+    import chromadb  # type: ignore
+except ModuleNotFoundError:
+    chromadb = None
 
 import re
 
@@ -218,8 +229,13 @@ class CommunityAnalytics:
 
 class VectorStore:
     def __init__(self):
-        self.chroma_dir = os.path.join(os.getcwd(), "chroma_db")
-        self.client = chromadb.PersistentClient(path=self.chroma_dir)
+        if chromadb is None:
+            print("Vector store unavailable: 'chromadb' is not installed.")
+            self.client = None
+            self.collection = None
+            return
+
+        self.client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
         try:
             self.collection = self.client.get_collection("trendscout_snippets")
             print(f"Vector Store loaded: {self.collection.count()} documents from ChromaDB.")
@@ -246,6 +262,9 @@ class VectorStore:
     def search(self, query: str, top_k: int = 5, recency_bias: bool = False) -> List[Dict[str, Any]]:
         if self.collection is None:
             return []
+
+        if ollama is None:
+            raise RuntimeError("Ollama python package is not installed. Run: pip install -r requirements.txt")
 
         # Embed query
         response = ollama.embeddings(model=config.LLM_MODEL, prompt=query)
@@ -306,6 +325,9 @@ class VectorStore:
 class GraphStore:
     def __init__(self):
         self.driver = None
+        if GraphDatabase is None:
+            print("Graph store unavailable: 'neo4j' is not installed.")
+            return
         try:
             self.driver = GraphDatabase.driver(
                 config.NEO4J_URI,
@@ -332,14 +354,11 @@ class GraphStore:
             return {"funding": [], "hiring": [], "partnership": [], "product": []}
         
         query = """
-        // Find snippets that mention the entity
-        MATCH (e:Entity {name: $entity_name})<-[:MENTIONS]-(a:Article)<-[:IN]-(s:Snippet)
-        // Find the specific KPIs associated with those snippets
-        MATCH (s)-[:ABOUT]->(k:KPI)
+        MATCH (e:Entity {name: $entity_name})-[:HAS_KPI]->(k:KPI)<-[:ABOUT]-(s:Snippet)
         WITH s, k
         ORDER BY k.date DESC
         LIMIT $limit
-        RETURN s.text as snippet_text, // The original article text
+        RETURN s.text as snippet_text,
                k.type as kpi_type,
                k.stance as stance,
                k.date as published,
@@ -429,7 +448,7 @@ class GraphStore:
         UNWIND $names AS name
         MATCH (e:Entity {name: name})<-[r:MENTIONS]-(a:Article)
         OPTIONAL MATCH (a)-[:BELONGS_TO]->(i:Industry)
-        OPTIONAL MATCH (a)-[rm:REPORTED_METRIC]->(m:Metric)
+        OPTIONAL MATCH (e)-[:HAS_KPI]->(k:KPI)<-[:ABOUT]-(s:Snippet)-[:IN]->(a)
         RETURN e.name as entity, i.name as industry, 
                a.title as title,
                r.stance as stance,
@@ -437,7 +456,7 @@ class GraphStore:
                a.swot_Weakness as weakness,
                a.swot_Opportunity as opportunity,
                a.swot_Threat as threat,
-               collect(DISTINCT {name: m.name, value: rm.value}) as metrics
+               collect(DISTINCT {type: k.type, value: k.value, date: k.date, stance: k.stance}) as kpis
         LIMIT 20
         """
         
@@ -460,10 +479,11 @@ class GraphStore:
                 if swot_parts:
                     info += " | SWOT: " + ", ".join(swot_parts)
 
-                metrics = [m for m in record['metrics'] if m['name'] is not None]
-                if metrics:
-                    m_list = [f"{m['name']}: {m['value']}" for m in metrics]
-                    info += f" | Metrics: {', '.join(m_list)}"
+                kpis = [k for k in record.get('kpis', []) if k and k.get('type') and k.get('value')]
+                if kpis:
+                    kpis = kpis[:4]
+                    k_list = [f"{k['type']}: {k['value']}" for k in kpis]
+                    info += f" | Signals: {', '.join(k_list)}"
                 
                 context.append(info)
         return context
@@ -474,8 +494,8 @@ class GraphStore:
             return []
             
         query = """
-        MATCH (i:Industry {name: $name})<-[:BELONGS_TO]-(a:Article)-[:MENTIONS]->(e:Entity)
-        RETURN e.name as entity, count(a) as mentions, avg(a.sentiment) as avg_sentiment
+        MATCH (i:Industry {name: $name})<-[:BELONGS_TO]-(a:Article)-[r:MENTIONS]->(e:Entity)
+        RETURN e.name as entity, count(a) as mentions, avg(r.stance) as avg_sentiment
         ORDER BY mentions DESC
         LIMIT 10
         """
@@ -587,6 +607,8 @@ class TrendScoutBackend:
 
     def extract_query_intent(self, query: str) -> dict:
         """Parse query to extract entities, industry, intent type, and temporal indicators."""
+        if ollama is None:
+            return {"entities": [], "industry": None, "intent": "general", "temporal": False}
         
         prompt = f"""
         Analyze this query: "{query}"
@@ -605,6 +627,8 @@ class TrendScoutBackend:
             return {"entities": [], "industry": None, "intent": "general", "temporal": False}
 
     def generate_answer(self, query: str, return_context: bool = False) -> str | dict:
+        if ollama is None:
+            raise RuntimeError("Ollama is required to generate answers. Install dependencies and ensure Ollama is running.")
         # Step 1: Figure out what the user wants
         intent_data = self.extract_query_intent(query)
         entities = intent_data.get('entities', [])
@@ -748,8 +772,9 @@ class TrendScoutBackend:
         3. **Community Analysis (Aggregated)**: High-level trends, rankings, SWOT counts, and growth forecasts. Use this for "big picture" trends and statistical backing.
 
         CORE INSTRUCTIONS:
-        1. **Synthesize, Don't Just List**: Do not just output a list of facts from a single source. Weave the information into a coherent narrative answer. For example, instead of "The ranking score is X," say "The company is ranked highly, indicating strong market momentum, which is supported by recent news of their product launch."
-        2. **Evidence-Based and Attributed**: When making a claim (e.g., "OpenAI is growing"), cite the specific metric from the Community Analysis (e.g., "with a Growth Slope of 410.0") or the specific event from the News Snippets.
+        1. **Synthesize, Don't Just List**: Weave facts into a coherent narrative. Treat rankings as *conversation intensity*, not automatically "good" performance.
+           - Example: Instead of "The ranking score is X," say "The company is being discussed a lot right now; the drivers look mostly positive/negative based on the cited events."
+        2. **Evidence-Based and Attributed**: When making a claim (e.g., "OpenAI is trending"), cite the specific metric (mentions/score/slope) and also the *direction* (positive vs negative) from the extracted event stances and/or Quantifiable SWOT.
         3. **Structure Your Answer**: Start with a high-level summary. Then, use markdown headings (e.g., `### Key Developments`, `### Competitive Landscape`, `### SWOT Analysis`) to organize your answer.
         4. **Use Tables for Comparisons**: When comparing multiple entities, use a markdown table to present the data clearly. If you have ranking data, present it in a table.
         5. **Quantify SWOT**: When performing a SWOT analysis, use the provided "Quantifiable SWOT" metrics (Sentiment Score, Sentiment Trend) to support your claims about whether the company's position is strong, weak, improving, or declining.
@@ -764,19 +789,19 @@ class TrendScoutBackend:
         fact_check_instruction = """
         CRITICAL WRITING STYLE INSTRUCTIONS:
         1. **Natural, Conversational Tone**: Write like a market analyst speaking to a colleague, not a robot reading data.
-           - ❌ AVOID: "Based on the context", "According to the data", "The analysis shows", "Community-Level Analysis", "Knowledge Graph"
-           - ✅ USE: "Recent developments show", "The market is seeing", "Companies are focusing on", "Industry data reveals"
+           - [NO] AVOID: "Based on the context", "According to the data", "The analysis shows", "Community-Level Analysis", "Knowledge Graph"
+           - [OK] USE: "Recent developments show", "The market is seeing", "Companies are focusing on", "Industry data reveals"
         
         2. **Seamless Integration**: Blend data into your narrative naturally.
-           - ❌ BAD: "OpenAI has a Growth Slope of 410.0 according to Community Analysis"
-           - ✅ GOOD: "OpenAI is experiencing rapid growth, showing exceptional market momentum with strong investor interest"
+           - [NO] BAD: "OpenAI has a Growth Slope of 410.0 according to Community Analysis"
+           - [OK] GOOD: "OpenAI is drawing unusually high attention right now, and most of the recent drivers are risk/negative vs growth/positive (cite the events)."
         
         3. **Human-Readable Insights**: Translate technical metrics into business insights.
-           - Turn "score: 4374.5, slope: 410.0" into "showing exceptional market leadership and accelerating growth trajectory"
+           - Turn "score: 4374.5, slope: 410.0" into "attention is high and increasing quickly" (but do not claim business growth unless the snippet evidence supports it)
            - Turn "mentions: 218" into "dominating industry conversations" or "leading the narrative"
-           - Turn "rank: 1" into "emerging as the clear market leader"
+           - Turn "rank: 1" into "the center of the current conversation" (not "market leader")
         
-        ⚠️ CRITICAL PRODUCT ATTRIBUTION RULES (MUST FOLLOW EXACTLY):
+        [WARN] CRITICAL PRODUCT ATTRIBUTION RULES (MUST FOLLOW EXACTLY):
         
         **STEP 1: IDENTIFY THE COMPANY FROM CONTEXT**
         - Look for explicit statements like "xAI released Grok", "OpenAI announced GPT-4", "Google unveiled Gemini"
@@ -793,12 +818,12 @@ class TrendScoutBackend:
         - **Mistral AI**: Mistral, Mixtral, Mistral Large
         
         **STEP 3: CROSS-CHECK FOR COMMON ERRORS**
-        - ❌ WRONG: "OpenAI's Grok" (Grok is xAI's product)
-        - ❌ WRONG: "Google's ChatGPT" (ChatGPT is OpenAI's product)
-        - ❌ WRONG: "Anthropic's Gemini" (Gemini is Google's product)
-        - ✅ CORRECT: "xAI's Grok 4.1 Fast achieved exceptional performance"
-        - ✅ CORRECT: "OpenAI's ChatGPT continues to dominate"
-        - ✅ CORRECT: "Google's Gemini competes with OpenAI's GPT-4"
+        - [NO] WRONG: "OpenAI's Grok" (Grok is xAI's product)
+        - [NO] WRONG: "Google's ChatGPT" (ChatGPT is OpenAI's product)
+        - [NO] WRONG: "Anthropic's Gemini" (Gemini is Google's product)
+        - [OK] CORRECT: "xAI's Grok 4.1 Fast achieved exceptional performance"
+        - [OK] CORRECT: "OpenAI's ChatGPT continues to dominate"
+        - [OK] CORRECT: "Google's Gemini competes with OpenAI's GPT-4"
         
         **STEP 4: IF UNSURE, USE NEUTRAL LANGUAGE**
         - Instead of "OpenAI released Grok", say "Grok was released" (then identify xAI if context allows)
@@ -824,23 +849,23 @@ class TrendScoutBackend:
         
         CRITICAL FINAL VERIFICATION CHECKLIST (Check before responding):
         
-        ✓ STEP 1: For EVERY product mentioned, verify the company:
-           - Grok → Must be xAI (NOT OpenAI)
-           - ChatGPT/GPT-4/o1 → Must be OpenAI (NOT xAI)
-           - Gemini → Must be Google (NOT OpenAI or Anthropic)
-           - Claude → Must be Anthropic (NOT OpenAI or Google)
+        [OK] STEP 1: For EVERY product mentioned, verify the company:
+           - Grok -> Must be xAI (NOT OpenAI)
+           - ChatGPT/GPT-4/o1 -> Must be OpenAI (NOT xAI)
+           - Gemini -> Must be Google (NOT OpenAI or Anthropic)
+           - Claude -> Must be Anthropic (NOT OpenAI or Google)
         
-        ✓ STEP 2: Check the source text for explicit attribution:
-           - Look for "xAI released Grok" ✓ CORRECT
-           - Reject "OpenAI's Grok" ✗ WRONG - Fix to "xAI's Grok"
+        [OK] STEP 2: Check the source text for explicit attribution:
+           - Look for "xAI released Grok" [OK] CORRECT
+           - Reject "OpenAI's Grok" [FAIL] WRONG - Fix to "xAI's Grok"
            - If you see only "Grok 4.1 Fast" without company, search context for xAI/Elon Musk mentions
         
-        ✓ STEP 3: Red flags to watch for:
+        [OK] STEP 3: Red flags to watch for:
            - Multiple products from different companies in one sentence (risk of mixing them up)
            - Headlines that juxtapose companies (e.g., "OpenAI vs Grok" - doesn't mean OpenAI owns Grok)
            - Table data or pricing lists (often garbled - ignore if unclear)
         
-        ✓ STEP 4: Before finalizing, ask yourself:
+        [OK] STEP 4: Before finalizing, ask yourself:
            - "Did I correctly attribute EVERY product to the right company?"
            - "Did I verify against the master product list above?"
            - "If I'm unsure about a product's owner, did I use neutral language or omit it?"

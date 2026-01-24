@@ -4,7 +4,6 @@ from collections import defaultdict
 
 import pandas as pd
 import networkx as nx
-from community import community_louvain
 from neo4j import GraphDatabase
 
 
@@ -13,6 +12,13 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import config
+
+
+try:
+    # Provided by the `python-louvain` package (module name: `community`)
+    from community import community_louvain  # type: ignore
+except Exception:  # pragma: no cover
+    community_louvain = None
 
 
 def load_kpi_entities() -> pd.DataFrame:
@@ -27,38 +33,49 @@ def load_kpi_entities() -> pd.DataFrame:
     return df
 
 
-def build_article_graph(df_entities: pd.DataFrame) -> nx.Graph:
+def build_article_graph(
+    df_entities: pd.DataFrame,
+    snippet_to_article: dict[str, str],
+    all_article_ids: list[str] | None = None,
+) -> nx.Graph:
     """Build article co-occurrence graph where edges represent shared entity mentions."""
-    
-    # Map each article to its mentioned entities
-    snippet_to_ents: dict[str, set[str]] = defaultdict(set)
+
+    article_to_ents: dict[str, set[str]] = defaultdict(set)
     for row in df_entities.itertuples(index=False):
-        snippet_to_ents[row.snippet_id].add(str(row.entity_name).strip())
+        sid = str(row.snippet_id)
+        aid = snippet_to_article.get(sid)
+        if not aid:
+            continue
+        article_to_ents[aid].add(str(row.entity_name).strip())
 
-    # Now, initialize the graph with all our articles as nodes
+    # Initialize graph nodes. If we have a full article list, include isolated nodes too.
     G = nx.Graph()
-    for sid in snippet_to_ents.keys():
-        G.add_node(sid)
+    if all_article_ids:
+        for aid in all_article_ids:
+            G.add_node(aid)
+            article_to_ents.setdefault(aid, set())
+    else:
+        for aid in article_to_ents.keys():
+            G.add_node(aid)
 
-    snippet_ids = list(snippet_to_ents.keys())
-    n = len(snippet_ids)
-    print(f"Building article graph over {n} snippets...")
+    article_ids = list(G.nodes())
+    n = len(article_ids)
+    print(f"Building article graph over {n} articles...")
 
-    # Compare articles pairwise to find shared entities
-    # O(n^2) complexity acceptable for moderate dataset sizes
+    # Compare articles pairwise to find shared entities (O(n^2) acceptable for demo scale).
     for i in range(n):
-        s_i = snippet_ids[i]
-        ents_i = snippet_to_ents[s_i]
+        a_i = article_ids[i]
+        ents_i = article_to_ents[a_i]
         if not ents_i:
             continue
         for j in range(i + 1, n):
-            s_j = snippet_ids[j]
-            ents_j = snippet_to_ents[s_j]
+            a_j = article_ids[j]
+            ents_j = article_to_ents[a_j]
             if not ents_j:
                 continue
             shared = ents_i.intersection(ents_j)
             if shared:
-                G.add_edge(s_i, s_j, weight=len(shared))
+                G.add_edge(a_i, a_j, weight=len(shared))
 
     print(f"Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
     return G
@@ -91,15 +108,29 @@ def run_louvain(G: nx.Graph) -> dict:
         # No edges: assign each node to separate community
         return {node: idx for idx, node in enumerate(G.nodes())}
 
-    partition = community_louvain.best_partition(G, weight="weight")
-    print(f"Detected {len(set(partition.values()))} communities.")
+    # Prefer python-louvain if available (fast + stable API)
+    if community_louvain is not None:
+        partition = community_louvain.best_partition(G, weight="weight")
+        print(f"Detected {len(set(partition.values()))} communities.")
+        return partition
+
+    # Fallback: NetworkX built-in Louvain (no extra dependency).
+    # Produces a list of sets, one per community.
+    from networkx.algorithms.community import louvain_communities  # type: ignore
+
+    communities = louvain_communities(G, weight="weight", seed=42)
+    partition = {}
+    for cid, nodes in enumerate(communities):
+        for node in nodes:
+            partition[node] = cid
+    print(f"Detected {len(communities)} communities (networkx fallback).")
     return partition
 
 
 def export_communities(partition: dict, out_path: str):
     rows = [
-        {"snippet_id": sid, "community_id": cid}
-        for sid, cid in partition.items()
+        {"article_id": str(aid), "community_id": int(cid)}
+        for aid, cid in partition.items()
     ]
     df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -107,7 +138,7 @@ def export_communities(partition: dict, out_path: str):
     print(f"Saved {len(df)} article-community mappings to {out_path}")
 
 
-def store_communities_in_neo4j(partition: dict, driver):
+def store_communities_in_neo4j(partition: dict, driver, reset_existing: bool = True):
     """
     Store cluster assignments in Neo4j as :Cluster nodes with :HAS relationships.
     This enables queries like 'get all articles in cluster X' directly from the graph.
@@ -122,6 +153,8 @@ def store_communities_in_neo4j(partition: dict, driver):
         clusters[cluster_id].append(article_id)
     
     with driver.session() as session:
+        if reset_existing:
+            session.run("MATCH (c:Cluster) DETACH DELETE c")
         for cluster_id, article_ids in clusters.items():
             session.run("""
                 MERGE (c:Cluster {id: $cluster_id})
@@ -136,7 +169,7 @@ def store_communities_in_neo4j(partition: dict, driver):
                 'article_ids': article_ids
             })
     
-    print("✅ Clusters stored in Neo4j with :HAS relationships")
+    print("Clusters stored in Neo4j with :HAS relationships")
 
 
 def main():
@@ -147,16 +180,36 @@ def main():
     )
     
     try:
+        expected_articles = None
+        all_article_ids: list[str] | None = None
+        snippet_to_article: dict[str, str] = {}
+        if os.path.exists(config.SNIPPETS_FILE):
+            try:
+                df_snip = pd.read_parquet(config.SNIPPETS_FILE, columns=["snippet_id", "article_id"])
+                df_snip = df_snip.dropna(subset=["snippet_id", "article_id"]).copy()
+                df_snip["snippet_id"] = df_snip["snippet_id"].astype(str)
+                df_snip["article_id"] = df_snip["article_id"].astype(str)
+                snippet_to_article = dict(zip(df_snip["snippet_id"], df_snip["article_id"]))
+                all_article_ids = sorted(df_snip["article_id"].unique().tolist())
+                expected_articles = len(all_article_ids)
+            except Exception:
+                expected_articles = None
+
         # Build graph from existing CO_LINK edges in Neo4j
         G = build_article_graph_from_neo4j(driver)
         
-        # Fallback: if no CO_LINK edges exist, use old method
-        if G.number_of_edges() == 0:
-            print("No CO_LINK edges found in Neo4j. Using fallback entity co-occurrence method...")
+        # Fallback: CO_LINK graph may be too sparse; use entity co-occurrence across snippets.
+        min_nodes = 30
+        if expected_articles is not None:
+            min_nodes = max(min_nodes, int(expected_articles * 0.60))
+
+        if G.number_of_edges() == 0 or G.number_of_nodes() < min_nodes:
+            reason = "no CO_LINK edges" if G.number_of_edges() == 0 else f"sparse CO_LINK graph ({G.number_of_nodes()} nodes < {min_nodes})"
+            print(f"[WARN] Using fallback entity co-occurrence method due to {reason}...")
             print("Loading KPI/entity data...")
             df_ent = load_kpi_entities()
             print(f"Loaded {len(df_ent)} entity rows.")
-            G = build_article_graph(df_ent)
+            G = build_article_graph(df_ent, snippet_to_article=snippet_to_article, all_article_ids=all_article_ids)
         
         # Run community detection
         partition = run_louvain(G)
@@ -164,7 +217,7 @@ def main():
         # Store in both parquet and Neo4j
         out_path = os.path.join(config.DATA_DIR, "article_communities.parquet")
         export_communities(partition, out_path)
-        store_communities_in_neo4j(partition, driver)
+        store_communities_in_neo4j(partition, driver, reset_existing=True)
         
     finally:
         driver.close()

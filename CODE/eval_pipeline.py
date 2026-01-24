@@ -130,10 +130,13 @@ def evaluate_community_quality():
     """
     color_print("\n--- Evaluating Component: Community & Cluster Quality ---", 'blue')
     
-    # 1. Article Community Modularity (Gᵃ)
+    # 1. Article Community Modularity (G_a)
     try:
         import networkx as nx
-        from community import community_louvain
+        try:
+            from community import community_louvain  # type: ignore
+        except Exception:
+            community_louvain = None
 
         driver = get_neo4j_driver()
         with driver.session() as session:
@@ -145,14 +148,24 @@ def evaluate_community_quality():
             G.add_weighted_edges_from(edges)
             
             df_comm = pd.read_parquet(os.path.join(config.DATA_DIR, "article_communities.parquet"))
-            partition = dict(zip(df_comm['snippet_id'], df_comm['community_id']))
+            id_col = "article_id" if "article_id" in df_comm.columns else "snippet_id"
+            partition = dict(zip(df_comm[id_col].astype(str), df_comm['community_id']))
             
             # Filter partition to nodes present in the graph
             filtered_partition = {node: comm for node, comm in partition.items() if node in G}
 
             if filtered_partition:
-                modularity = community_louvain.modularity(filtered_partition, G)
-                color_print(f"  - Article Community Modularity (Gᵃ): {modularity:.4f}", 'green' if modularity > 0.4 else 'yellow')
+                if community_louvain is not None:
+                    modularity = community_louvain.modularity(filtered_partition, G)
+                else:
+                    from networkx.algorithms.community.quality import modularity as nx_modularity  # type: ignore
+
+                    # Convert mapping to list[set] expected by nx modularity
+                    comm_to_nodes = {}
+                    for node, cid in filtered_partition.items():
+                        comm_to_nodes.setdefault(cid, set()).add(node)
+                    modularity = nx_modularity(G, list(comm_to_nodes.values()), weight="weight")
+                color_print(f"  - Article Community Modularity (G_a): {modularity:.4f}", 'green' if modularity > 0.4 else 'yellow')
             else:
                 color_print("  - Could not calculate modularity: No nodes from partition in graph.", 'red')
         else:
@@ -161,7 +174,7 @@ def evaluate_community_quality():
     except Exception as e:
         color_print(f"  - Modularity calculation failed: {e}", 'red')
 
-    # 2. KPI Cluster Silhouette Score (Gᵏ) - for a sample cluster
+    # 2. KPI Cluster Silhouette Score (G_k) - for a sample cluster
     try:
         from sentence_transformers import SentenceTransformer
         df_kpi_clusters = pd.read_parquet(os.path.join(config.DATA_DIR, "kpi_clusters.parquet"))
@@ -183,7 +196,7 @@ def evaluate_community_quality():
             
             # This part is complex as we need to map snippets to their embeddings and kpi cluster labels
             # For simplicity, we'll assume we can get this mapping. A full implementation would require more joins.
-            color_print("  - Silhouette Score (Gᵏ): Placeholder - requires complex data joins.", 'yellow')
+            color_print("  - Silhouette Score (G_k): Placeholder - requires complex data joins.", 'yellow')
         else:
             color_print("  - Skipping Silhouette Score: No suitable sample cluster found.", 'yellow')
 

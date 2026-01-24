@@ -31,7 +31,48 @@ wheels/
 env/
 venv/
 
-# Generated Vector DB (Re-creatable from data/)
-chroma_db/
+# Local environment overrides
+.env.*
 
-# Ignore large binary files if any, but keeping data/ as requested
+# Generated data artifacts (re-creatable)
+DATA/*.parquet
+DATA/*.bak_*
+DATA/*_migrated.parquet
+DATA/*_v2.parquet
+DATA/_test_*
+DATA/_test*.txt
+
+# Windows case-insensitive path can show as `data/` in git
+data/*.parquet
+data/*.bak_*
+data/*_migrated.parquet
+data/*_v2.parquet
+data/_test_*
+data/_test*.txt
+
+# Bootstrap artifacts (may contain scraped content; keep local only)
+data_bootstrap/*.parquet
+CODE/data_bootstrap/*.parquet
+
+# Generated Vector DB
+chroma_db/
+CODE/chroma_db/
+
+# Evaluation outputs
+EVALUATIONS/
+
+# Node/React build artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npmrc
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Local working docs (keep README.md as the only GitHub-facing doc)
+DATA_QUALITY.md
