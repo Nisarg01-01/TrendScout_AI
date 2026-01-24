@@ -1,4 +1,5 @@
 import os
+from typing import Dict, List
 try:
     from dotenv import load_dotenv  # type: ignore
     from dotenv import dotenv_values  # type: ignore
@@ -25,12 +26,12 @@ def _strip_env_value(raw: str) -> str:
     return s
 
 
-def _parse_env_file(env_path: str) -> dict[str, str]:
+def _parse_env_file(env_path: str) -> Dict[str, str]:
     """
     Minimal .env parser used as a fallback when python-dotenv isn't installed.
     Supports KEY=VALUE with optional quotes. Ignores comments/blank lines.
     """
-    out: dict[str, str] = {}
+    out: Dict[str, str] = {}
     try:
         with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -62,7 +63,7 @@ def _load_env_file():
     if not os.path.exists(env_path):
         return
 
-    values: dict[str, str] = {}
+    values: Dict[str, str] = {}
 
     if load_dotenv is not None:
         try:
@@ -90,7 +91,7 @@ def _load_env_file():
 _load_env_file()
 
 # Feeds
-FEEDS: list[str] = [
+FEEDS: List[str] = [
     "https://techcrunch.com/category/startups/feed/",
     "https://techcrunch.com/tag/artificial-intelligence/feed/",
     "https://venturebeat.com/category/ai/feed/",
@@ -116,7 +117,7 @@ FETCH_FULL_TEXT = os.getenv("FETCH_FULL_TEXT", "1").strip() not in {"0", "false"
 MIN_ARTICLE_TEXT_CHARS = int(os.getenv("MIN_ARTICLE_TEXT_CHARS", "400"))
 
 # Keywords for Filtering
-AI_KEYWORDS: list[str] = [
+AI_KEYWORDS: List[str] = [
     "artificial intelligence", "ai", "ai-powered", "ai-native",
     "machine learning", "ml", "deep learning", "neural network",
     "generative ai", "genai", "foundation model", "frontier model",
@@ -127,7 +128,7 @@ AI_KEYWORDS: list[str] = [
 ]
 
 # Business/Startup context: use these to avoid pulling in consumer "AI" noise.
-STARTUP_SIGNAL_KEYWORDS: list[str] = [
+STARTUP_SIGNAL_KEYWORDS: List[str] = [
     "startup",
     "venture",
     "vc",
@@ -159,7 +160,7 @@ STARTUP_SIGNAL_KEYWORDS: list[str] = [
 ]
 
 # Common consumer/low-signal exclusions (keeps dataset "AI startups / market" focused).
-EXCLUDE_KEYWORDS: list[str] = [
+EXCLUDE_KEYWORDS: List[str] = [
     "review",
     "hands-on",
     "deal",

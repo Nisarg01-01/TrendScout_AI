@@ -11,6 +11,7 @@ import re
 import argparse
 from typing import Any
 import hashlib
+from typing import Dict, List, Optional
 
 try:
     from jsonschema import validate as jsonschema_validate  # type: ignore
@@ -51,7 +52,7 @@ GENERIC_ENTITY_NAME_STOPLIST = {
 }
 
 
-def _backup_file_copy(path: str) -> str | None:
+def _backup_file_copy(path: str) -> Optional[str]:
     if not path or not os.path.exists(path):
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -197,7 +198,7 @@ Return JSON with keys:
 }}
 """
 
-EXTRACTION_SCHEMA: dict[str, Any] = {
+EXTRACTION_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": True,
     "properties": {
@@ -272,13 +273,13 @@ def _is_junk_entity_name(name: str) -> bool:
     return False
 
 
-def _pick_primary_entity(data: dict[str, Any]) -> str:
+def _pick_primary_entity(data: Dict[str, Any]) -> str:
     pe = _norm_entity_name(data.get("primary_entity"))
     if pe:
         return pe
 
     entities = data.get("entities") or []
-    names: list[str] = []
+    names: List[str] = []
     for ent in entities:
         if isinstance(ent, str):
             n = _norm_entity_name(ent)
@@ -542,7 +543,7 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
             # Fallback for simple string KPIs
             kpi_type = "General"
             kpi_value = kpi
-            kpi_data: dict[str, Any] = {"value_text": kpi}
+            kpi_data: Dict[str, Any] = {"value_text": kpi}
         else:
             kpi_type = _as_str(kpi.get("type")) or "Other"
             kpi_value = _as_str(kpi.get("value_text")) or _as_str(kpi)
@@ -811,7 +812,7 @@ def process_snippets(
     model: str,
     out_path: str,
     max_workers: int = 2,
-    max_snippets: int | None = None,
+    max_snippets: Optional[int] = None,
     num_predict: int = 512,
     filter_kpi: bool = False,
     save_every: int = 25,
