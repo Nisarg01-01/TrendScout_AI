@@ -80,19 +80,34 @@ def build_article_graph(
     print(f"Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
     return G
 
-def build_article_graph_from_neo4j(driver) -> nx.Graph:
+def build_article_graph_from_neo4j(driver, all_article_ids: list[str] | None = None) -> nx.Graph:
     """
     Builds a networkx graph directly from the :CO_LINK relationships in Neo4j.
     This is the primary method for loading the graph for community detection.
     """
     print("Building graph from :CO_LINK edges in Neo4j...")
     G = nx.Graph()
+    if all_article_ids:
+        for aid in all_article_ids:
+            G.add_node(aid)
     with driver.session() as session:
         result = session.run("""
-            MATCH (a1:Article)-[r:CO_LINK]->(a2:Article)
+            MATCH (a1:Article)-[r:CO_LINK]-(a2:Article)
             RETURN a1.id AS source, a2.id AS target, r.weight AS weight
         """)
-        edges = [(r['source'], r['target'], r['weight']) for r in result]
+        edges = []
+        seen = set()
+        for r in result:
+            s = str(r["source"])
+            t = str(r["target"])
+            if not s or not t or s == "nan" or t == "nan":
+                continue
+            a, b = (s, t) if s < t else (t, s)
+            key = (a, b)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append((a, b, float(r["weight"] or 0.0)))
     
     if edges:
         G.add_weighted_edges_from(edges)
@@ -195,16 +210,19 @@ def main():
             except Exception:
                 expected_articles = None
 
-        # Build graph from existing CO_LINK edges in Neo4j
-        G = build_article_graph_from_neo4j(driver)
+        # Build graph from existing CO_LINK edges in Neo4j (include isolated articles too).
+        G = build_article_graph_from_neo4j(driver, all_article_ids=all_article_ids)
         
         # Fallback: CO_LINK graph may be too sparse; use entity co-occurrence across snippets.
         min_nodes = 30
         if expected_articles is not None:
             min_nodes = max(min_nodes, int(expected_articles * 0.60))
 
-        if G.number_of_edges() == 0 or G.number_of_nodes() < min_nodes:
-            reason = "no CO_LINK edges" if G.number_of_edges() == 0 else f"sparse CO_LINK graph ({G.number_of_nodes()} nodes < {min_nodes})"
+        # If we have no edges at all, community detection can't work; fallback to co-occurrence.
+        # If edges exist but are very sparse, co-occurrence can still be better at demo scale.
+        sparse_edges = G.number_of_edges() < max(1, int(G.number_of_nodes() * 0.5))
+        if G.number_of_edges() == 0 or (G.number_of_nodes() >= min_nodes and sparse_edges):
+            reason = "no CO_LINK edges" if G.number_of_edges() == 0 else f"sparse CO_LINK graph (edges={G.number_of_edges()}, nodes={G.number_of_nodes()})"
             print(f"[WARN] Using fallback entity co-occurrence method due to {reason}...")
             print("Loading KPI/entity data...")
             df_ent = load_kpi_entities()

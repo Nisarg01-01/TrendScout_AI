@@ -72,3 +72,53 @@ class TestExtractLlm(unittest.TestCase):
             self.assertTrue(float(funding[0].get("kpi_amount", 0.0)) > 0.0)
         finally:
             extract_llm.extract_from_snippet = original
+
+    def test_structured_kpis_capture_counterparts(self):
+        payload = {
+            "primary_entity": "OpenAI",
+            "entities": [{"name": "OpenAI", "type": "Big Tech"}, {"name": "AI", "type": "Other"}],
+            "sector": "Enterprise Software",
+            "industry": "Generative AI",
+            "kpis": [
+                {
+                    "type": "Acquisition",
+                    "entity": "OpenAI",
+                    "target": "XYZ Labs",
+                    "description": "acqui-hire",
+                    "value_text": "acquired XYZ Labs",
+                    "polarity": 0,
+                    "confidence": 0.8,
+                },
+                {
+                    "type": "Competition",
+                    "entity": "OpenAI",
+                    "competitor": "Google",
+                    "description": "market position",
+                    "value_text": "behind Google",
+                    "polarity": -1,
+                    "confidence": 0.7,
+                },
+            ],
+            "swot": [],
+            "stance": 0.0,
+        }
+
+        original = extract_llm.extract_from_snippet
+        try:
+            extract_llm.extract_from_snippet = lambda text, model, num_predict=512: payload
+            row = {"snippet_id": "s4", "text": "OpenAI acquired XYZ Labs. OpenAI is behind Google in enterprise AI."}
+            out = extract_llm.process_single_row(row, model="x", num_predict=10)
+
+            ents = [r for r in out if r.get("category") == "Entity"]
+            self.assertEqual([e["entity_name"] for e in ents], ["OpenAI"])  # "AI" should be filtered as junk
+
+            acq = [r for r in out if r.get("category") == "KPI" and r.get("detail_type") == "Acquisition"]
+            self.assertEqual(len(acq), 1)
+            self.assertEqual(acq[0].get("kpi_target"), "XYZ Labs")
+            self.assertIn("acquired", acq[0].get("detail_value", ""))
+
+            comp = [r for r in out if r.get("category") == "KPI" and r.get("detail_type") == "Competition"]
+            self.assertEqual(len(comp), 1)
+            self.assertEqual(comp[0].get("kpi_competitor"), "Google")
+        finally:
+            extract_llm.extract_from_snippet = original

@@ -36,6 +36,33 @@ class StartupRanker:
         # Temporal windows
         self.recency_window = 60  # days
         self.tau = 30  # decay parameter
+
+    def _is_junk_entity_name(self, name: str) -> bool:
+        n = str(name or "").strip()
+        if not n:
+            return True
+        low = n.lower()
+        junk = {
+            "ai",
+            "artificial intelligence",
+            "generative ai",
+            "ai systems",
+            "businesses",
+            "companies",
+            "company",
+            "the company",
+            "your company",
+            "tech companies",
+            "data centers",
+            "unknown",
+        }
+        if low in junk:
+            return True
+        if len(n) <= 2:
+            return True
+        if low.endswith(" company") or low.endswith(" companies"):
+            return True
+        return False
     
     def close(self):
         self.driver.close()
@@ -88,15 +115,17 @@ class StartupRanker:
         print(f"[OK] Computed centrality for {len(cluster_centrality)} clusters")
         return cluster_centrality
     
-    def compute_kpi_stance_scores(self) -> Dict[str, Dict[int, float]]:
+    def compute_kpi_signal_scores(self) -> tuple[Dict[str, Dict[int, float]], Dict[str, Dict[int, float]], Dict[str, Dict[int, float]]]:
         """
-        Compute KPI stance scores for each entity in each cluster.
-        Aggregates positive/negative KPIs with recency decay.
-        Returns: {entity_name: {cluster_id: stance_score}}
+        Compute KPI momentum/risk signals for each entity in each cluster.
+        - momentum: sum(max(stance,0)) with confidence + recency decay
+        - risk:     sum(max(-stance,0)) with confidence + recency decay
+        - net:      momentum - risk (signed)
         """
-        print("Computing KPI stance scores...")
+        print("Computing KPI momentum/risk scores...")
         
-        entity_stance = defaultdict(lambda: defaultdict(float))
+        entity_momentum = defaultdict(lambda: defaultdict(float))
+        entity_risk = defaultdict(lambda: defaultdict(float))
         now = datetime.now()
         
         with self.driver.session() as session:
@@ -106,13 +135,25 @@ class StartupRanker:
                 MATCH (e)-[:HAS_KPI]->(k)
                 WHERE k.stance IS NOT NULL AND k.date IS NOT NULL
                 RETURN e.name as entity_name, c.id as cluster_id,
-                       k.stance as stance, k.date as date
+                       k.stance as stance, k.confidence as confidence, k.date as date
             """)
             
             for record in result:
                 entity = record['entity_name']
                 cid = record['cluster_id']
-                stance = record['stance']
+                if self._is_junk_entity_name(entity):
+                    continue
+
+                try:
+                    stance = float(record['stance'])
+                except Exception:
+                    continue
+
+                try:
+                    conf = float(record.get("confidence") or 1.0)
+                except Exception:
+                    conf = 1.0
+                conf = max(0.0, min(1.0, conf))
                 
                 try:
                     date_str = record['date']
@@ -121,15 +162,26 @@ class StartupRanker:
                     
                     # Recency decay
                     recency_weight = np.exp(-days_old / self.tau)
-                    
-                    # Weighted stance
-                    entity_stance[entity][cid] += stance * recency_weight
+
+                    w = recency_weight * conf
+                    if stance >= 0:
+                        entity_momentum[entity][cid] += stance * w
+                    else:
+                        entity_risk[entity][cid] += (-stance) * w
                 except:
-                    # If date parsing fails, use stance without decay
-                    entity_stance[entity][cid] += stance
+                    w = conf
+                    if stance >= 0:
+                        entity_momentum[entity][cid] += stance * w
+                    else:
+                        entity_risk[entity][cid] += (-stance) * w
         
-        print(f"[OK] Computed stance scores for {len(entity_stance)} entities")
-        return dict(entity_stance)
+        net = defaultdict(lambda: defaultdict(float))
+        for ent in set(list(entity_momentum.keys()) + list(entity_risk.keys())):
+            for cid in set(list(entity_momentum[ent].keys()) + list(entity_risk[ent].keys())):
+                net[ent][cid] = entity_momentum[ent][cid] - entity_risk[ent][cid]
+
+        print(f"[OK] Computed KPI signals for {len(net)} entities")
+        return dict(net), dict(entity_momentum), dict(entity_risk)
     
     def compute_investor_quality_scores(self) -> Dict[str, Dict[int, float]]:
         """
@@ -211,7 +263,7 @@ class StartupRanker:
         print("\nComputing composite startup scores...")
         
         centrality = self.compute_centrality_per_cluster()
-        stance = self.compute_kpi_stance_scores()
+        net_stance, momentum, risk = self.compute_kpi_signal_scores()
         recency = self.compute_recency_scores()
         investor = self.compute_investor_quality_scores()
         
@@ -228,16 +280,19 @@ class StartupRanker:
             for record in result:
                 entity = record['entity_name']
                 cid = record['cluster_id']
+                if self._is_junk_entity_name(entity):
+                    continue
                 
                 # Get individual scores (default to 0 if missing)
                 cent_score = centrality.get(cid, {}).get(entity, 0.0)
-                stance_score = stance.get(entity, {}).get(cid, 0.0)
+                stance_score = net_stance.get(entity, {}).get(cid, 0.0)
+                mom_score = momentum.get(entity, {}).get(cid, 0.0)
+                risk_score = risk.get(entity, {}).get(cid, 0.0)
                 rec_score = recency.get(entity, {}).get(cid, 0.0)
                 inv_score = investor.get(entity, {}).get(cid, 0.0)
                 
-                # Normalize stance (can be negative)
-                stance_norm = (stance_score + 10) / 20  # Map [-10, 10] to [0, 1]
-                stance_norm = max(0, min(1, stance_norm))
+                # Normalize net stance to [0,1] without losing sign information (tanh squashes extremes).
+                stance_norm = (np.tanh(stance_score) + 1.0) / 2.0
                 
                 # Composite score
                 composite = (
@@ -252,6 +307,8 @@ class StartupRanker:
                     'cluster_id': cid,
                     'centrality': cent_score,
                     'kpi_stance': stance_score,
+                    'kpi_momentum': mom_score,
+                    'kpi_risk': risk_score,
                     'recency': rec_score,
                     'investor_quality': inv_score,
                     'composite_score': composite
@@ -279,6 +336,8 @@ class StartupRanker:
                     SET r.score = score, r.rank = rank,
                         r.centrality = $centrality,
                         r.kpi_stance = $kpi_stance,
+                        r.kpi_momentum = $kpi_momentum,
+                        r.kpi_risk = $kpi_risk,
                         r.recency = $recency,
                         r.investor_quality = $investor_quality
                 """, {
@@ -288,6 +347,8 @@ class StartupRanker:
                     'rank': int(row['rank']),
                     'centrality': float(row['centrality']),
                     'kpi_stance': float(row['kpi_stance']),
+                    'kpi_momentum': float(row.get('kpi_momentum', 0.0) or 0.0),
+                    'kpi_risk': float(row.get('kpi_risk', 0.0) or 0.0),
                     'recency': float(row['recency']),
                     'investor_quality': float(row['investor_quality'])
                 })

@@ -354,32 +354,55 @@ class GraphStore:
             return {"funding": [], "hiring": [], "partnership": [], "product": []}
         
         query = """
-        MATCH (e:Entity {name: $entity_name})-[:HAS_KPI]->(k:KPI)<-[:ABOUT]-(s:Snippet)
-        WITH s, k
+        MATCH (e:Entity {name: $entity_name})-[:HAS_KPI]->(k:KPI)<-[:ABOUT]-(s:Snippet)-[:IN]->(a:Article)
+        WITH s, k, a
         ORDER BY k.date DESC
         LIMIT $limit
         RETURN s.text as snippet_text,
                k.type as kpi_type,
                k.stance as stance,
                k.date as published,
-               k.value as kpi_value
+               k.value as kpi_value,
+               coalesce(k.source_url, a.link) as source_url,
+               a.title as title,
+               a.source as source
         """
         
-        result_dict = {"funding": [], "hiring": [], "partnership": [], "product": []}
+        result_dict = {
+            "funding": [],
+            "hiring": [],
+            "layoffs": [],
+            "partnership": [],
+            "product": [],
+            "acquisition": [],
+            "competition": [],
+            "regulation": [],
+            "lawsuit": [],
+            "security": [],
+            "outage": [],
+            "pricing": [],
+            "policy": [],
+            "other": [],
+        }
         
         with self.driver.session() as session:
             result = session.run(query, entity_name=entity_name, limit=limit)
             for record in result:
-                kpi_type = record.get('kpi_type', 'other')
+                kpi_type_raw = record.get('kpi_type', 'other')
+                kpi_type = str(kpi_type_raw).strip().lower() if kpi_type_raw is not None else "other"
+                if kpi_type not in result_dict:
+                    kpi_type = "other"
                 kpi_info = {
                     "snippet": record['snippet_text'],
                     "stance": float(record['stance']) if record['stance'] else 0.0,
                     "published": record['published'],
-                    "kpi_value": record['kpi_value']
+                    "kpi_value": record['kpi_value'],
+                    "source_url": record.get('source_url'),
+                    "title": record.get('title'),
+                    "source": record.get('source'),
                 }
                 
-                if kpi_type in result_dict:
-                    result_dict[kpi_type].append(kpi_info)
+                result_dict[kpi_type].append(kpi_info)
         
         return result_dict
     
@@ -715,14 +738,46 @@ class TrendScoutBackend:
             # NEW: Get detailed KPI breakdown for primary entity
             kpi_breakdown = self.graph_store.get_kpi_breakdown_for_entity(primary_entity, limit=5)
             if any(kpi_breakdown.values()):
+                all_events: list[dict[str, Any]] = []
+                for kpi_type, kpis in kpi_breakdown.items():
+                    for k in kpis:
+                        all_events.append({"type": kpi_type, **(k or {})})
+
+                pos = sum(1 for e in all_events if float(e.get("stance", 0.0) or 0.0) > 0.25)
+                neg = sum(1 for e in all_events if float(e.get("stance", 0.0) or 0.0) < -0.25)
+                neu = max(0, len(all_events) - pos - neg)
+
                 kpi_summary = []
                 for kpi_type, kpis in kpi_breakdown.items():
                     if kpis:
-                        kpi_summary.append(f"{kpi_type.upper()}: {len(kpis)} events")
+                        kpi_summary.append(f"{kpi_type.upper()}: {len(kpis)}")
                 if kpi_summary:
                     community_context.append(
-                        f"KPI Breakdown for {primary_entity}: {', '.join(kpi_summary)}"
+                        f"Recent event signals for {primary_entity}: {', '.join(kpi_summary)} (pos={pos}, neg={neg}, neutral={neu})"
                     )
+
+                def _fmt_driver(e: dict) -> str:
+                    stance = float(e.get("stance", 0.0) or 0.0)
+                    tag = "POS" if stance > 0.25 else ("NEG" if stance < -0.25 else "NEU")
+                    src = e.get("source") or "Source"
+                    pub = e.get("published") or "date"
+                    val = str(e.get("kpi_value") or "").replace("\n", " ").strip()
+                    url = str(e.get("source_url") or "").strip()
+                    if len(val) > 140:
+                        val = val[:137] + "..."
+                    suffix = f" ({src}, {pub})"
+                    if url:
+                        suffix += f" [{url}]"
+                    return f"- [{tag}] {str(e.get('type', 'kpi')).upper()}: {val}{suffix}"
+
+                drivers = all_events[:]
+                try:
+                    drivers.sort(key=lambda x: str(x.get("published") or ""), reverse=True)
+                except Exception:
+                    pass
+                drivers = drivers[:6]
+                if drivers:
+                    community_context.append("Event drivers (latest):\n" + "\n".join(_fmt_driver(d) for d in drivers))
             
             # NEW: Get investor quality data
             investor_info = self.graph_store.get_investor_quality_for_entity(primary_entity)
@@ -774,6 +829,7 @@ class TrendScoutBackend:
         CORE INSTRUCTIONS:
         1. **Synthesize, Don't Just List**: Weave facts into a coherent narrative. Treat rankings as *conversation intensity*, not automatically "good" performance.
            - Example: Instead of "The ranking score is X," say "The company is being discussed a lot right now; the drivers look mostly positive/negative based on the cited events."
+           - IMPORTANT: "Trending" can be driven by negative attention (risk). Separate Attention vs Momentum (positive events) vs Risk (negative events).
         2. **Evidence-Based and Attributed**: When making a claim (e.g., "OpenAI is trending"), cite the specific metric (mentions/score/slope) and also the *direction* (positive vs negative) from the extracted event stances and/or Quantifiable SWOT.
         3. **Structure Your Answer**: Start with a high-level summary. Then, use markdown headings (e.g., `### Key Developments`, `### Competitive Landscape`, `### SWOT Analysis`) to organize your answer.
         4. **Use Tables for Comparisons**: When comparing multiple entities, use a markdown table to present the data clearly. If you have ranking data, present it in a table.

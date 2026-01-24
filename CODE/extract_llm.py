@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import argparse
 from typing import Any
+import hashlib
 
 try:
     from jsonschema import validate as jsonschema_validate  # type: ignore
@@ -23,6 +24,31 @@ except Exception:  # pragma: no cover
 
 # Output File
 KPI_ENTITIES_FILE = os.path.join(config.DATA_DIR, "kpi_entities.parquet")
+
+GENERIC_ENTITY_NAME_STOPLIST = {
+    "ai",
+    "artificial intelligence",
+    "generative ai",
+    "genai",
+    "ai systems",
+    "systems",
+    "business",
+    "businesses",
+    "company",
+    "companies",
+    "the company",
+    "your company",
+    "social media company",
+    "tech company",
+    "tech companies",
+    "data center",
+    "data centers",
+    "startup",
+    "startups",
+    "investor",
+    "investors",
+    "unknown",
+}
 
 
 def _backup_file_copy(path: str) -> str | None:
@@ -227,6 +253,24 @@ def _norm_entity_name(name: Any) -> str:
     s = s.strip("`'\"")
     return s.strip()
 
+def _is_junk_entity_name(name: str) -> bool:
+    n = _as_str(name).strip()
+    if not n:
+        return True
+    low = n.lower().strip()
+    if low in GENERIC_ENTITY_NAME_STOPLIST:
+        return True
+    # Very short tokens are almost always noise (e.g., "AI", "US").
+    if len(n) <= 2:
+        return True
+    # Generic phrases that show up as placeholders in snippets.
+    if low.endswith(" company") or low.endswith(" companies"):
+        return True
+    # Purely numeric/punctuation strings.
+    if not re.search(r"[a-zA-Z]", n):
+        return True
+    return False
+
 
 def _pick_primary_entity(data: dict[str, Any]) -> str:
     pe = _norm_entity_name(data.get("primary_entity"))
@@ -426,6 +470,7 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
     
     snippet_id = row["snippet_id"]
     text = row["text"]
+    snippet_text_hash = _as_str(row.get("text_hash"))
     local_results = []
     
     # Be tolerant to older monkeypatches/tests that don't accept the new kwarg.
@@ -475,11 +520,12 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
             ent_name = _norm_entity_name(ent.get("name"))
             ent_type = _as_str(ent.get("type")) or "Unknown"
 
-        if not ent_name:
+        if not ent_name or _is_junk_entity_name(ent_name):
             continue
 
         local_results.append({
             "snippet_id": snippet_id,
+            "snippet_text_hash": snippet_text_hash or None,
             "entity_name": ent_name,
             "entity_type": ent_type,
             "industry": industry,
@@ -544,6 +590,7 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
             # Store structured funding data
             local_results.append({
                 "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
                 "entity_name": subject_entity or None,
                 "entity_type": None,
                 "industry": industry,
@@ -569,6 +616,7 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
             
             local_results.append({
                 "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
                 "entity_name": subject_entity or None,
                 "entity_type": None,
                 "industry": industry,
@@ -581,10 +629,37 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
                 "kpi_roles": json.dumps(kpi_data.get("roles", []) or []),
                 "kpi_skills": json.dumps(kpi_data.get("skills", []) or []),
             })
+
+        elif kpi_type == "Layoffs":
+            count_raw = kpi_data.get("count", 0)
+            if isinstance(count_raw, str):
+                count = parse_hiring_count(count_raw)
+            else:
+                try:
+                    count = int(count_raw) if count_raw else 0
+                except Exception:
+                    count = 0
+
+            local_results.append({
+                "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
+                "entity_name": subject_entity or None,
+                "entity_type": None,
+                "industry": industry,
+                "category": "KPI",
+                "detail_type": "Layoffs",
+                "detail_value": kpi_value,
+                "stance": kpi_row_stance,
+                "confidence": confidence,
+                "kpi_count": count,
+                "kpi_roles": json.dumps(kpi_data.get("roles", []) or []),
+                "kpi_skills": json.dumps(kpi_data.get("skills", []) or []),
+            })
             
         elif kpi_type == "Partnership":
             local_results.append({
                 "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
                 "entity_name": subject_entity or None,
                 "entity_type": None,
                 "industry": industry,
@@ -596,10 +671,27 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
                 "kpi_partner": _as_str(kpi_data.get("partner")),
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
-            
+
+        elif kpi_type == "Acquisition":
+            local_results.append({
+                "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
+                "entity_name": subject_entity or None,
+                "entity_type": None,
+                "industry": industry,
+                "category": "KPI",
+                "detail_type": "Acquisition",
+                "detail_value": kpi_value,
+                "stance": kpi_row_stance,
+                "confidence": confidence,
+                "kpi_target": _as_str(kpi_data.get("target")),
+                "kpi_description": _as_str(kpi_data.get("description")),
+            })
+
         elif kpi_type == "Product":
             local_results.append({
                 "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
                 "entity_name": subject_entity or None,
                 "entity_type": None,
                 "industry": industry,
@@ -611,11 +703,27 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
                 "kpi_product_name": _as_str(kpi_data.get("name")),
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
-            
-        else:
-            # Generic KPI
+
+        elif kpi_type == "Competition":
             local_results.append({
                 "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
+                "entity_name": subject_entity or None,
+                "entity_type": None,
+                "industry": industry,
+                "category": "KPI",
+                "detail_type": "Competition",
+                "detail_value": kpi_value,
+                "stance": kpi_row_stance,
+                "confidence": confidence,
+                "kpi_competitor": _as_str(kpi_data.get("competitor")),
+                "kpi_description": _as_str(kpi_data.get("description")),
+            })
+
+        elif kpi_type in {"Regulation", "Policy", "Lawsuit", "Security", "Outage", "Pricing"}:
+            local_results.append({
+                "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
                 "entity_name": subject_entity or None,
                 "entity_type": None,
                 "industry": industry,
@@ -624,6 +732,23 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
                 "detail_value": kpi_value,
                 "stance": kpi_row_stance,
                 "confidence": confidence,
+                "kpi_description": _as_str(kpi_data.get("description")),
+            })
+            
+        else:
+            # Generic KPI
+            local_results.append({
+                "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
+                "entity_name": subject_entity or None,
+                "entity_type": None,
+                "industry": industry,
+                "category": "KPI",
+                "detail_type": kpi_type,
+                "detail_value": kpi_value,
+                "stance": kpi_row_stance,
+                "confidence": confidence,
+                "kpi_description": _as_str(kpi_data.get("description")),
             })
 
     # Add SWOT
@@ -642,6 +767,7 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
 
         local_results.append({
             "snippet_id": snippet_id,
+            "snippet_text_hash": snippet_text_hash or None,
             "entity_name": swot_entity or None,
             "entity_type": None,
             "industry": industry,
@@ -656,6 +782,7 @@ def process_single_row(row, model: str, num_predict: int, prompt_style: str = "f
         return [
             {
                 "snippet_id": snippet_id,
+                "snippet_text_hash": snippet_text_hash or None,
                 "entity_name": None,
                 "entity_type": None,
                 "industry": industry,
@@ -698,6 +825,10 @@ def process_snippets(
 
     df = pd.read_parquet(config.SNIPPETS_FILE)
     print(f"Loaded {len(df)} snippets.")
+    if "text_hash" not in df.columns and "text" in df.columns:
+        # Backfill for older snippets.parquet files.
+        df = df.copy()
+        df["text_hash"] = df["text"].astype(str).map(lambda s: hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest())
     current_snippet_ids = set(df["snippet_id"].astype(str)) if "snippet_id" in df.columns else set()
 
     # Incremental Processing Logic
@@ -715,6 +846,17 @@ def process_snippets(
                 existing_df = pd.read_parquet(out_path)
                 if 'snippet_id' in existing_df.columns:
                     existing_ids = set(existing_df['snippet_id'].astype(str).unique())
+                    # If we have text hashes, re-process snippet_ids whose content changed.
+                    if "snippet_text_hash" in existing_df.columns and "text_hash" in df.columns:
+                        cur_hash = dict(zip(df["snippet_id"].astype(str), df["text_hash"].astype(str)))
+                        stale_ids = set()
+                        for r in existing_df[["snippet_id", "snippet_text_hash"]].dropna().itertuples(index=False):
+                            sid = str(r.snippet_id)
+                            if sid in cur_hash and str(r.snippet_text_hash) != str(cur_hash[sid]):
+                                stale_ids.add(sid)
+                        if stale_ids:
+                            print(f"[WARN] {len(stale_ids)} snippets changed text since last extraction; re-processing them.")
+                            existing_ids = existing_ids - stale_ids
                     stale = bool(current_snippet_ids) and any(sid not in current_snippet_ids for sid in existing_ids)
                     if stale:
                         bak = _backup_file_copy(out_path)

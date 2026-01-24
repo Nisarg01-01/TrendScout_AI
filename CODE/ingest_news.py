@@ -9,6 +9,7 @@ import os
 import re
 from urllib.parse import urlsplit
 from typing import Iterable
+import hashlib
 
 try:
     import requests  # type: ignore
@@ -31,17 +32,83 @@ def parse_entry_published(entry: dict) -> str:
     return str(published)
 
 
+_BOILERPLATE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\bToggle Mega Menu\b", re.IGNORECASE),
+    re.compile(r"\bSite Search\b", re.IGNORECASE),
+    re.compile(r"\bSubmit Site Search\b", re.IGNORECASE),
+    re.compile(r"\bTechCrunch Desktop Logo\b", re.IGNORECASE),
+    re.compile(r"\bTechCrunch Mobile Logo\b", re.IGNORECASE),
+    re.compile(r"\bCrunchboard\b", re.IGNORECASE),
+    re.compile(r"\bNewsletters\b", re.IGNORECASE),
+    re.compile(r"\bPartner Content\b", re.IGNORECASE),
+]
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\u00a0", " ")).strip()
+
+
+def _text_quality_score(text: str) -> float:
+    """
+    Heuristic quality score for extracted full text.
+    Higher is better. Used to decide whether to upsert newer text.
+    """
+    t = _normalize_text(text)
+    if not t:
+        return 0.0
+    penalty = 0.0
+    for pat in _BOILERPLATE_PATTERNS:
+        if pat.search(t):
+            penalty += 0.2
+    # Penalize extremely long "menu-like" blobs with very low punctuation density.
+    punct = sum(1 for ch in t if ch in ".?!;:")
+    if len(t) > 1200 and punct / max(1, len(t)) < 0.002:
+        penalty += 0.2
+    # Penalize low alpha ratio (lots of symbols / nav separators).
+    alpha = sum(1 for ch in t if ch.isalpha())
+    if alpha / max(1, len(t)) < 0.55:
+        penalty += 0.2
+    return max(0.0, 1.0 - penalty)
+
+
 def extract_text_from_html(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
+    for tag in soup(["header", "footer", "nav", "aside"]):
+        try:
+            tag.decompose()
+        except Exception:
+            pass
+
+    def extract_from_container(container) -> str:
+        if container is None:
+            return ""
+        # Prefer paragraph-like content over full text to avoid navigation menus.
+        parts: list[str] = []
+        for el in container.find_all(["p", "h2", "h3", "li"], recursive=True):
+            s = el.get_text(" ", strip=True)
+            s = _normalize_text(s)
+            if len(s) < 20:
+                continue
+            parts.append(s)
+        text = "\n".join(parts)
+        return _normalize_text(text)
+
     article_tag = soup.find("article")
-    if article_tag:
-        return article_tag.get_text(" ", strip=True)
+    text = extract_from_container(article_tag)
+    if len(text) >= int(getattr(config, "MIN_ARTICLE_TEXT_CHARS", 400) or 400):
+        return text
+
     main_tag = soup.find("main")
-    if main_tag:
-        return main_tag.get_text(" ", strip=True)
-    return soup.get_text(" ", strip=True)
+    text = extract_from_container(main_tag)
+    if len(text) >= int(getattr(config, "MIN_ARTICLE_TEXT_CHARS", 400) or 400):
+        return text
+
+    # Fallback: best-effort whole-page text.
+    raw = soup.get_text("\n", strip=True)
+    raw = _normalize_text(raw)
+    return raw
 
 
 def fetch_full_text(url: str, timeout_s: int = 15) -> str:
@@ -56,7 +123,15 @@ def fetch_full_text(url: str, timeout_s: int = 15) -> str:
     try:
         resp = requests.get(url, timeout=timeout_s, headers={"User-Agent": "TrendScoutAI/1.0"})
         resp.raise_for_status()
-        return extract_text_from_html(resp.text)
+        txt = extract_text_from_html(resp.text)
+        # Drop known boilerplate patterns (best-effort).
+        for pat in _BOILERPLATE_PATTERNS:
+            txt = pat.sub(" ", txt)
+        txt = _normalize_text(txt)
+        # If still low quality, return empty so we fall back to RSS summary.
+        if _text_quality_score(txt) < 0.55:
+            return ""
+        return txt
     except Exception:
         return ""
 
@@ -209,6 +284,9 @@ def save_articles(new_df: pd.DataFrame):
                 if new_src == "fetched" and old_src != "fetched":
                     should_upgrade = True
                 if new_src == "fetched" and len(new_text) > len(old_text) * 1.2:
+                    should_upgrade = True
+                # Upgrade if we materially improved text quality (even if shorter).
+                if new_text and (_text_quality_score(new_text) > _text_quality_score(old_text) + 0.15):
                     should_upgrade = True
 
                 if should_upgrade and new_text:

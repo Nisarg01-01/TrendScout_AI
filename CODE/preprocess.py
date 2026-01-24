@@ -3,6 +3,8 @@ import os
 import re
 import config
 from tqdm import tqdm
+import hashlib
+import argparse
 
 from utils.id_utils import make_article_id, make_snippet_id
 
@@ -10,9 +12,29 @@ def clean_text(text: str) -> str:
     """Basic text cleaning."""
     if not isinstance(text, str):
         return ""
-    # Remove extra whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    t = text.replace("\u00a0", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Best-effort boilerplate stripping for common RSS/full-text artifacts.
+    boilerplate_phrases = [
+        "TechCrunch Desktop Logo",
+        "TechCrunch Mobile Logo",
+        "Toggle Mega Menu",
+        "Submit Site Search",
+        "Site Search",
+        "Crunchboard",
+        "Loading the player",
+    ]
+    for p in boilerplate_phrases:
+        t = re.sub(re.escape(p), " ", t, flags=re.IGNORECASE)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def text_hash(text: str) -> str:
+    t = (text or "").encode("utf-8", errors="ignore")
+    return hashlib.sha1(t).hexdigest()
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
     """Split text into overlapping chunks."""
@@ -41,7 +63,7 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]
             
     return chunks
 
-def process_articles():
+def process_articles(rebuild: bool = False):
     """Load raw articles, clean, chunk, and append snippets incrementally."""
     if not os.path.exists(config.ARTICLES_FILE):
         print("No articles file found.")
@@ -54,7 +76,7 @@ def process_articles():
     existing_ids = set()
     existing_keys = set()
 
-    if os.path.exists(config.SNIPPETS_FILE):
+    if (not rebuild) and os.path.exists(config.SNIPPETS_FILE):
         existing_df = pd.read_parquet(config.SNIPPETS_FILE)
         if not existing_df.empty:
             for row in existing_df.itertuples(index=False):
@@ -101,12 +123,13 @@ def process_articles():
                 "title": row.get("title", ""),
                 "link": row.get("link", ""),
                 "text": chunk,
+                "text_hash": text_hash(chunk),
                 "published": row.get("published", ""),
                 "chunk_index": i,
                 "parent_fetched_at": row.get("fetched_at", "")
             })
 
-    if not snippets:
+    if not snippets and not rebuild:
         print("No new snippets generated.")
         return
 
@@ -114,7 +137,10 @@ def process_articles():
 
     os.makedirs(config.DATA_DIR, exist_ok=True)
 
-    if not existing_df.empty:
+    if rebuild:
+        combined_df = new_snippets_df
+        print(f"Rebuilt snippets store with {len(combined_df)} rows.")
+    elif not existing_df.empty:
         combined_df = pd.concat([existing_df, new_snippets_df], ignore_index=True)
         combined_df = combined_df.drop_duplicates(subset=["snippet_id"])
         print(f"Existing snippets: {len(existing_df)}, new: {len(new_snippets_df)}, final: {len(combined_df)}")
@@ -131,7 +157,11 @@ def process_articles():
     print("-------------------------------------\n")
 
 def main():
-    process_articles()
+    parser = argparse.ArgumentParser(description="Preprocess articles into deterministic snippets.")
+    parser.add_argument("--rebuild", action="store_true", help="Rebuild snippets.parquet from scratch (overwrites file).")
+    args = parser.parse_args()
+
+    process_articles(rebuild=bool(args.rebuild))
 
 if __name__ == "__main__":
     main()

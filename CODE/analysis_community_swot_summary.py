@@ -13,6 +13,34 @@ if ROOT_DIR not in sys.path:
 import config
 
 
+def _is_junk_entity_name(name: str) -> bool:
+    n = str(name or "").strip()
+    if not n:
+        return True
+    low = n.lower()
+    junk = {
+        "ai",
+        "artificial intelligence",
+        "generative ai",
+        "ai systems",
+        "businesses",
+        "companies",
+        "company",
+        "the company",
+        "your company",
+        "tech companies",
+        "data centers",
+        "unknown",
+    }
+    if low in junk:
+        return True
+    if len(n) <= 2:
+        return True
+    if low.endswith(" company") or low.endswith(" companies"):
+        return True
+    return False
+
+
 def load_data() -> Dict[str, pd.DataFrame]:
     communities_path = os.path.join(config.DATA_DIR, "article_communities.parquet")
     if not os.path.exists(communities_path):
@@ -74,6 +102,7 @@ def compute_community_swot(df_kpi_comm: pd.DataFrame) -> pd.DataFrame:
     # Aggregate entity mentions and sentiment
     df_ent = df_kpi_comm[df_kpi_comm["category"] == "Entity"].copy()
     df_ent = df_ent[df_ent["entity_name"].notna() & (df_ent["entity_name"].str.strip() != "")]
+    df_ent = df_ent[~df_ent["entity_name"].astype(str).map(_is_junk_entity_name)]
     ent_agg = (
         df_ent.groupby(["community_id", "entity_name"], as_index=False)
         .agg(mentions=("entity_name", "count"), avg_stance=("stance", "mean"))
@@ -95,6 +124,8 @@ def compute_community_temporal(df_kpi_comm: pd.DataFrame, df_snip: pd.DataFrame)
 
     # Count entity mentions per community per month
     df_ent = df[df["category"] == "Entity"].copy()
+    df_ent = df_ent[df_ent["entity_name"].notna() & (df_ent["entity_name"].astype(str).str.strip() != "")]
+    df_ent = df_ent[~df_ent["entity_name"].astype(str).map(_is_junk_entity_name)]
     temporal = (
         df_ent.groupby(["community_id", "year_month"], as_index=False)
         .agg(entity_mentions=("entity_name", "count"))

@@ -116,6 +116,75 @@ class GraphBuilder:
             
         return df_kpi, df_snippets, entity_map
 
+    def _parse_json_list(self, raw):
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+            return []
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        s = str(raw).strip()
+        if not s or s.lower() == "nan":
+            return []
+        try:
+            v = json.loads(s)
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+        except Exception:
+            pass
+        try:
+            v = literal_eval(s)
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if str(x).strip()]
+        except Exception:
+            pass
+        return []
+
+    def _safe_float(self, raw) -> float:
+        if raw is None:
+            return 0.0
+        if isinstance(raw, float) and np.isnan(raw):
+            return 0.0
+        try:
+            return float(raw)
+        except Exception:
+            return 0.0
+
+    def _safe_int(self, raw) -> int:
+        if raw is None:
+            return 0
+        if isinstance(raw, float) and np.isnan(raw):
+            return 0
+        try:
+            return int(raw)
+        except Exception:
+            return 0
+
+    def _is_junk_entity_name(self, name: str) -> bool:
+        n = str(name or "").strip()
+        if not n:
+            return True
+        low = n.lower()
+        junk = {
+            "ai",
+            "artificial intelligence",
+            "generative ai",
+            "ai systems",
+            "businesses",
+            "companies",
+            "company",
+            "the company",
+            "your company",
+            "tech companies",
+            "data centers",
+            "unknown",
+        }
+        if low in junk:
+            return True
+        if len(n) <= 2:
+            return True
+        if low.endswith(" company") or low.endswith(" companies"):
+            return True
+        return False
+
     def build_graph(self):
         """Build knowledge graph by creating nodes and edges from extracted data.
         Creates Article, Entity, Industry, Snippet, and KPI nodes with relationships.
@@ -304,6 +373,8 @@ class GraphBuilder:
                         name = str(er.get("entity_name", "")).strip()
                         if not name:
                             continue
+                        if self._is_junk_entity_name(name):
+                            continue
                         entities_to_batch.append(
                             {
                                 "name": name,
@@ -350,12 +421,26 @@ class GraphBuilder:
                     session.run(
                         """
                         MATCH (sn:Snippet {id: $snippet_id})-[:IN]->(a:Article)
-                        MERGE (k:KPI {id: $kpi_id})
+                        MERGE (k:KPI:Event {id: $kpi_id})
                         SET k.type = $kpi_type,
                             k.value = $kpi_value,
                             k.stance = $stance,
                             k.confidence = $confidence,
-                            k.date = sn.date
+                            k.date = sn.date,
+                            k.source_url = a.link,
+                            k.article_id = a.id,
+                            k.snippet_id = sn.id,
+                            k.amount = $amount,
+                            k.stage = $stage,
+                            k.investors = $investors,
+                            k.count = $count,
+                            k.roles = $roles,
+                            k.skills = $skills,
+                            k.partner = $partner,
+                            k.target = $target,
+                            k.competitor = $competitor,
+                            k.product_name = $product_name,
+                            k.description = $description
                         MERGE (sn)-[:ABOUT]->(k)
                         """,
                         {
@@ -365,6 +450,17 @@ class GraphBuilder:
                             "kpi_value": kpi_value,
                             "stance": stance_val,
                             "confidence": conf_val,
+                            "amount": self._safe_float(row.get("kpi_amount")) if "kpi_amount" in row else 0.0,
+                            "stage": str(row.get("kpi_stage", "") or "").strip() if "kpi_stage" in row else "",
+                            "investors": self._parse_json_list(row.get("kpi_investors")) if "kpi_investors" in row else [],
+                            "count": self._safe_int(row.get("kpi_count")) if "kpi_count" in row else 0,
+                            "roles": self._parse_json_list(row.get("kpi_roles")) if "kpi_roles" in row else [],
+                            "skills": self._parse_json_list(row.get("kpi_skills")) if "kpi_skills" in row else [],
+                            "partner": str(row.get("kpi_partner", "") or "").strip() if "kpi_partner" in row else "",
+                            "target": str(row.get("kpi_target", "") or "").strip() if "kpi_target" in row else "",
+                            "competitor": str(row.get("kpi_competitor", "") or "").strip() if "kpi_competitor" in row else "",
+                            "product_name": str(row.get("kpi_product_name", "") or "").strip() if "kpi_product_name" in row else "",
+                            "description": str(row.get("kpi_description", "") or "").strip() if "kpi_description" in row else "",
                         },
                     )
 
@@ -377,6 +473,59 @@ class GraphBuilder:
                             """,
                             {"entity_name": entity_name, "kpi_id": kpi_id},
                         )
+
+                    # Role-aware counterpart links (typed, per-event) to reduce "graph spaghetti".
+                    # We attach the counterpart to the Event/KPI node, not via co-mention.
+                    if kpi_type == "Funding":
+                        investors = self._parse_json_list(row.get("kpi_investors"))
+                        if investors:
+                            inv_payload = [{"name": n} for n in investors if n and not self._is_junk_entity_name(n)]
+                            if inv_payload:
+                                session.run(
+                                    """
+                                    MATCH (k:KPI {id: $kpi_id})
+                                    UNWIND $investors AS inv
+                                    MERGE (i:Investor {name: inv.name})
+                                    MERGE (k)-[:COUNTERPART {role: 'Investor'}]->(i)
+                                    """,
+                                    {"kpi_id": kpi_id, "investors": inv_payload},
+                                )
+
+                    if kpi_type == "Partnership":
+                        partner = str(row.get("kpi_partner", "") or "").strip()
+                        if partner and not self._is_junk_entity_name(partner):
+                            session.run(
+                                """
+                                MATCH (k:KPI {id: $kpi_id})
+                                MERGE (p:Entity {name: $partner})
+                                MERGE (k)-[:COUNTERPART {role: 'Partner'}]->(p)
+                                """,
+                                {"kpi_id": kpi_id, "partner": partner},
+                            )
+
+                    if kpi_type == "Acquisition":
+                        target = str(row.get("kpi_target", "") or "").strip()
+                        if target and not self._is_junk_entity_name(target):
+                            session.run(
+                                """
+                                MATCH (k:KPI {id: $kpi_id})
+                                MERGE (t:Entity {name: $target})
+                                MERGE (k)-[:COUNTERPART {role: 'Target'}]->(t)
+                                """,
+                                {"kpi_id": kpi_id, "target": target},
+                            )
+
+                    if kpi_type == "Competition":
+                        competitor = str(row.get("kpi_competitor", "") or "").strip()
+                        if competitor and not self._is_junk_entity_name(competitor):
+                            session.run(
+                                """
+                                MATCH (k:KPI {id: $kpi_id})
+                                MERGE (c:Entity {name: $competitor})
+                                MERGE (k)-[:COUNTERPART {role: 'Competitor'}]->(c)
+                                """,
+                                {"kpi_id": kpi_id, "competitor": competitor},
+                            )
 
         print("Graph build phase 1 complete. Now creating Article-Article edges...")
         self._create_article_colinks(article_entities, article_dates)
@@ -404,11 +553,15 @@ class GraphBuilder:
             return 0.0
     
     def _create_article_colinks(self, article_entities: dict, article_dates: dict):
-        """Create weighted Article-Article edges based on Jaccard similarity of shared entities."""
+        """Create weighted Article-Article edges based on Jaccard similarity of shared entities.
+
+        Uses a per-article top-k strategy (instead of a global weight threshold) to avoid
+        overly sparse graphs that fragment communities on small datasets.
+        """
         print("Calculating Jaccard similarity for article pairs...")
         
         article_ids = list(article_entities.keys())
-        edges_to_create = []
+        neighbors: dict[str, list[dict]] = {aid: [] for aid in article_ids}
         tau = 30  # Recency decay parameter (days)
         now = pd.Timestamp.now(tz='UTC')  # Use timezone-aware timestamp
         
@@ -451,15 +604,26 @@ class GraphBuilder:
                 
                 # Final weight
                 weight = jaccard * recency_weight
-                
-                if weight > 0.1:  # Threshold to avoid too many weak edges
-                    edges_to_create.append({
-                        'aid1': aid1,
-                        'aid2': aid2,
-                        'weight': weight,
-                        'shared_entities': intersection
-                    })
+
+                if weight <= 0:
+                    continue
+
+                neighbors[aid1].append({'aid': aid2, 'weight': float(weight), 'shared_entities': int(intersection)})
+                neighbors[aid2].append({'aid': aid1, 'weight': float(weight), 'shared_entities': int(intersection)})
         
+        # Keep top-k neighbors per article to ensure connectivity without exploding edges.
+        top_k = 5
+        edge_map: dict[tuple[str, str], dict] = {}
+        for aid, nbrs in neighbors.items():
+            nbrs.sort(key=lambda x: x['weight'], reverse=True)
+            for n in nbrs[:top_k]:
+                a1, a2 = (aid, n['aid']) if aid < n['aid'] else (n['aid'], aid)
+                key = (a1, a2)
+                if key not in edge_map or n['weight'] > edge_map[key]['weight']:
+                    edge_map[key] = {'aid1': a1, 'aid2': a2, 'weight': n['weight'], 'shared_entities': n['shared_entities']}
+
+        edges_to_create = list(edge_map.values())
+
         print(f"Creating {len(edges_to_create)} CO_LINK relationships...")
         
         with self.driver.session() as session:
