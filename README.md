@@ -36,7 +36,7 @@ RSS Feeds
 - Python (pipeline, scoring, evaluation)
 - Neo4j (knowledge graph)
 - ChromaDB (vector store) + `sentence-transformers` (embeddings)
-- Ollama (local LLM inference for extraction)
+- Local LLM inference for extraction (Ollama or Hugging Face `transformers`)
 - Parquet (local artifacts in `DATA/`)
 - Streamlit (demo UI)
 
@@ -46,7 +46,9 @@ RSS Feeds
 
 - Python 3.10-3.12
 - Neo4j running locally or in the cloud
-- Ollama running locally (model configurable; default is `llama3.1` in `CODE/config.py`)
+- Either:
+  - Ollama running locally (model configurable; default is `llama3.1` in `CODE/config.py`), or
+  - A Hugging Face local model available to `transformers` (for HPC/offline runs)
 
 ### Setup
 
@@ -89,5 +91,13 @@ python -m unittest discover -v -s tests
 
 ## Repo notes
 
-- `DATA/` contains generated artifacts and is not meant to be committed.
+- `DATA/` contains generated artifacts and is not meant to be committed (large files, reproducible from RSS, and may contain copyrighted text).
 - Cleanup helper: `powershell -ExecutionPolicy Bypass -File scripts/cleanup_local_artifacts.ps1`
+
+## Running extraction without Ollama (Hugging Face, no API)
+
+If you want to run extraction on an HPC GPU node without relying on Ollama, you can use the Hugging Face backend:
+
+```bash
+python CODE/extract_llm.py --provider hf --hf-model Qwen/Qwen2.5-14B-Instruct --out DATA/kpi_entities.parquet
+```

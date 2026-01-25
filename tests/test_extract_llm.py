@@ -122,3 +122,40 @@ class TestExtractLlm(unittest.TestCase):
             self.assertEqual(comp[0].get("kpi_competitor"), "Google")
         finally:
             extract_llm.extract_from_snippet = original
+
+    def test_process_single_row_supports_injected_extract_fn(self):
+        calls = {"max_input_tokens": None, "trust_remote_code": None}
+
+        def fake_hf(text, model, num_predict=512, prompt_style="full", max_input_tokens=None, trust_remote_code=False):
+            calls["max_input_tokens"] = max_input_tokens
+            calls["trust_remote_code"] = trust_remote_code
+            return {
+                "primary_entity": "OpenAI",
+                "entities": [{"name": "OpenAI", "type": "Big Tech"}],
+                "sector": "Enterprise Software",
+                "industry": "AI",
+                "kpis": [],
+                "swot": [],
+                "stance": 0.0,
+            }
+
+        original = extract_llm.extract_from_snippet_hf
+        try:
+            extract_llm.extract_from_snippet_hf = fake_hf
+            row = {"snippet_id": "s5", "text": "OpenAI announced something."}
+            out = extract_llm.process_single_row(
+                row,
+                model="hf-model",
+                num_predict=16,
+                prompt_style="compact",
+                extract_fn=extract_llm.extract_from_snippet_hf,
+                hf_max_input_tokens=123,
+                hf_trust_remote_code=True,
+            )
+
+            self.assertEqual(calls["max_input_tokens"], 123)
+            self.assertEqual(calls["trust_remote_code"], True)
+            ents = [r for r in out if r.get("category") == "Entity"]
+            self.assertEqual([e["entity_name"] for e in ents], ["OpenAI"])
+        finally:
+            extract_llm.extract_from_snippet_hf = original

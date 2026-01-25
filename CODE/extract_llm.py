@@ -23,6 +23,17 @@ try:
 except Exception:  # pragma: no cover
     ollama = None
 
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+except Exception:  # pragma: no cover
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+
 # Output File
 KPI_ENTITIES_FILE = os.path.join(config.DATA_DIR, "kpi_entities.parquet")
 
@@ -384,6 +395,118 @@ def clean_json_response(response_text):
         response_text = response_text.split("```")[1].split("```")[0]
     return response_text.strip()
 
+_HF_MODEL = None
+_HF_TOKENIZER = None
+
+
+def _hf_available() -> bool:
+    return torch is not None and AutoModelForCausalLM is not None and AutoTokenizer is not None
+
+
+def _hf_device() -> str:
+    pref = (getattr(config, "HF_DEVICE", None) or "auto").strip().lower()
+    if pref in {"cpu", "cuda"}:
+        return pref
+    if torch is None:
+        return "cpu"
+    return "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
+
+
+def _hf_load_model(model_name: str, trust_remote_code: bool = False):
+    """
+    Lazy-load a Hugging Face model/tokenizer for local inference.
+
+    Notes:
+    - Uses device_map="auto" when CUDA is available.
+    - Uses deterministic decoding (do_sample=False) for extraction stability.
+    """
+    global _HF_MODEL, _HF_TOKENIZER
+    if _HF_MODEL is not None and _HF_TOKENIZER is not None:
+        return _HF_MODEL, _HF_TOKENIZER
+
+    if not _hf_available():
+        raise RuntimeError("HF backend requires `torch` + `transformers` in this environment.")
+
+    device = _hf_device()
+    device_map = "auto" if device == "cuda" else None
+
+    torch_dtype = None
+    if torch is not None and device == "cuda":
+        # Prefer bf16 on modern GPUs; fallback to fp16.
+        try:
+            torch_dtype = torch.bfloat16
+        except Exception:
+            torch_dtype = torch.float16
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=trust_remote_code,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+    )
+    model.eval()
+
+    _HF_MODEL = model
+    _HF_TOKENIZER = tokenizer
+    return _HF_MODEL, _HF_TOKENIZER
+
+
+def extract_from_snippet_hf(
+    text: str,
+    model: str,
+    num_predict: int = 512,
+    prompt_style: str = "full",
+    max_input_tokens: Optional[int] = None,
+    trust_remote_code: bool = False,
+):
+    """
+    Extract structured data from text using a local Hugging Face model (transformers).
+    Returns payload dict or None.
+    """
+    tpl = PROMPT_TEMPLATE if (prompt_style or "full") == "full" else COMPACT_PROMPT_TEMPLATE
+    prompt = tpl.format(text=text)
+
+    hf_model, hf_tokenizer = _hf_load_model(model, trust_remote_code=trust_remote_code)
+
+    max_in = int(max_input_tokens or getattr(config, "HF_MAX_INPUT_TOKENS", 3072))
+    inputs = hf_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_in)
+
+    # Best-effort: move inputs to model device when not using device_map="auto".
+    try:
+        model_device = getattr(hf_model, "device", None)
+        if model_device is not None:
+            inputs = {k: v.to(model_device) for k, v in inputs.items()}
+    except Exception:
+        pass
+
+    gen_kwargs = {
+        "max_new_tokens": int(num_predict),
+        "do_sample": False,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "pad_token_id": getattr(hf_tokenizer, "eos_token_id", None),
+    }
+
+    with torch.no_grad():  # type: ignore[union-attr]
+        output_ids = hf_model.generate(**inputs, **gen_kwargs)
+
+    input_len = int(inputs["input_ids"].shape[-1])
+    gen_ids = output_ids[0][input_len:]
+    raw_response = hf_tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+    cleaned_text = clean_json_response(raw_response)
+    try:
+        payload = json.loads(cleaned_text)
+    except Exception:
+        return None
+    if not _validate_payload(payload):
+        return None
+    return payload
+
 def extract_from_snippet(text: str, model: str, num_predict: int = 512, prompt_style: str = "full"):
     """Extract structured data from text using LLM with optimized settings."""
     
@@ -466,19 +589,40 @@ def _looks_kpi_relevant(text: str) -> bool:
     return any(k in t for k in keywords)
 
 
-def process_single_row(row, model: str, num_predict: int, prompt_style: str = "full"):
+def process_single_row(
+    row,
+    model: str,
+    num_predict: int,
+    prompt_style: str = "full",
+    extract_fn=None,
+    hf_max_input_tokens: Optional[int] = None,
+    hf_trust_remote_code: bool = False,
+):
     """Process article text to extract entities, KPIs, and SWOT data."""
     
     snippet_id = row["snippet_id"]
     text = row["text"]
     snippet_text_hash = _as_str(row.get("text_hash"))
     local_results = []
+
+    if extract_fn is None:
+        extract_fn = extract_from_snippet
     
     # Be tolerant to older monkeypatches/tests that don't accept the new kwarg.
     try:
-        data = extract_from_snippet(text, model, num_predict=num_predict, prompt_style=prompt_style)
+        if extract_fn is extract_from_snippet_hf:
+            data = extract_fn(
+                text,
+                model,
+                num_predict=num_predict,
+                prompt_style=prompt_style,
+                max_input_tokens=hf_max_input_tokens,
+                trust_remote_code=bool(hf_trust_remote_code),
+            )
+        else:
+            data = extract_fn(text, model, num_predict=num_predict, prompt_style=prompt_style)
     except TypeError:
-        data = extract_from_snippet(text, model, num_predict=num_predict)
+        data = extract_fn(text, model, num_predict=num_predict)
     
     if not data:
         return [
@@ -818,6 +962,9 @@ def process_snippets(
     save_every: int = 25,
     force: bool = False,
     prompt_style: str = "full",
+    provider: str = "ollama",
+    hf_max_input_tokens: Optional[int] = None,
+    hf_trust_remote_code: bool = False,
 ):
     """Process all snippets to extract structured data, filtering already processed ones."""
     if not os.path.exists(config.SNIPPETS_FILE):
@@ -892,15 +1039,30 @@ def process_snippets(
     failures = 0
     meta_only = 0
     
-    # Check if Ollama is reachable
-    if ollama is None:
-        print("Error: Python package `ollama` is not installed. Install it in your environment.")
-        return
+    provider = (provider or "ollama").strip().lower()
+    extract_fn = extract_from_snippet
 
-    try:
-        ollama.list()
-    except Exception:
-        print("Error: Ollama is not running. Please install and start Ollama.")
+    if provider == "ollama":
+        # Check if Ollama is reachable
+        if ollama is None:
+            print("Error: Python package `ollama` is not installed. Install it in your environment.")
+            return
+
+        try:
+            ollama.list()
+        except Exception:
+            print("Error: Ollama is not running. Please install and start Ollama.")
+            return
+    elif provider == "hf":
+        extract_fn = extract_from_snippet_hf
+        if not _hf_available():
+            print("Error: HF backend requires `torch` + `transformers` installed in this environment.")
+            return
+        if max_workers and int(max_workers) > 1:
+            print("[WARN] HF backend runs most reliably with --workers 1; forcing workers=1.")
+            max_workers = 1
+    else:
+        print(f"Error: Unknown provider '{provider}'. Use --provider ollama|hf.")
         return
 
     max_workers = int(max_workers) if max_workers and int(max_workers) > 0 else 1
@@ -911,17 +1073,19 @@ def process_snippets(
     completed = 0
     checkpoint_rows = 0
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        futures = [
-            executor.submit(process_single_row, row, model, num_predict, prompt_style)
-            for _, row in df_new.iterrows()
-        ]
-        
-        # Process as they complete
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting Intelligence"):
+    if int(max_workers) <= 1:
+        # Sequential execution (more stable for HF backend).
+        for _, row in tqdm(df_new.iterrows(), total=len(df_new), desc="Extracting Intelligence"):
             try:
-                batch_results = future.result()
+                batch_results = process_single_row(
+                    row,
+                    model=model,
+                    num_predict=num_predict,
+                    prompt_style=prompt_style,
+                    extract_fn=extract_fn,
+                    hf_max_input_tokens=hf_max_input_tokens,
+                    hf_trust_remote_code=bool(hf_trust_remote_code),
+                )
                 if (
                     len(batch_results) == 1
                     and isinstance(batch_results[0], dict)
@@ -941,8 +1105,50 @@ def process_snippets(
                         f"[INFO] checkpoint: {completed}/{len(df_new)} snippets, rows={checkpoint_rows}, "
                         f"failures={failures}, meta_only={meta_only}, eta~{eta_min:.1f}m"
                     )
-            except Exception as e:
+            except Exception:
                 failures += 1
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            futures = [
+                executor.submit(
+                    process_single_row,
+                    row,
+                    model,
+                    num_predict,
+                    prompt_style,
+                    extract_fn,
+                    hf_max_input_tokens,
+                    bool(hf_trust_remote_code),
+                )
+                for _, row in df_new.iterrows()
+            ]
+            
+            # Process as they complete
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting Intelligence"):
+                try:
+                    batch_results = future.result()
+                    if (
+                        len(batch_results) == 1
+                        and isinstance(batch_results[0], dict)
+                        and batch_results[0].get("category") == "Meta"
+                    ):
+                        meta_only += 1
+                    results.extend(batch_results)
+                    completed += 1
+                    if save_every and completed % int(save_every) == 0:
+                        new_results_df = pd.DataFrame(results)
+                        checkpoint_rows = _write_checkpoint(existing_df, new_results_df, out_path)
+                        elapsed = max(time.time() - started, 1e-6)
+                        rate = completed / elapsed
+                        remaining = len(df_new) - completed
+                        eta_min = (remaining / rate) / 60.0 if rate > 0 else float("inf")
+                        print(
+                            f"[INFO] checkpoint: {completed}/{len(df_new)} snippets, rows={checkpoint_rows}, "
+                            f"failures={failures}, meta_only={meta_only}, eta~{eta_min:.1f}m"
+                        )
+                except Exception:
+                    failures += 1
 
     if not results:
         print("No intelligence extracted.")
@@ -961,8 +1167,35 @@ def process_snippets(
     print("----------------------------------\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract structured KPIs/entities/SWOT from snippets using Ollama.")
-    parser.add_argument("--model", default=config.LLM_MODEL, help="Ollama model name (default: config.LLM_MODEL).")
+    parser = argparse.ArgumentParser(description="Extract structured KPIs/entities/SWOT from snippets using an LLM backend.")
+    parser.add_argument(
+        "--provider",
+        choices=["ollama", "hf"],
+        default=getattr(config, "LLM_PROVIDER", "ollama"),
+        help="LLM backend provider (default: config.LLM_PROVIDER).",
+    )
+    parser.add_argument(
+        "--model",
+        default=config.LLM_MODEL,
+        help="Model name. For --provider ollama: Ollama model name. For --provider hf: HF repo id or local path.",
+    )
+    parser.add_argument(
+        "--hf-model",
+        default=getattr(config, "HF_MODEL", "Qwen/Qwen2.5-7B-Instruct"),
+        help="HF model repo id/path (only used when --provider hf; overrides --model).",
+    )
+    parser.add_argument(
+        "--hf-max-input-tokens",
+        type=int,
+        default=getattr(config, "HF_MAX_INPUT_TOKENS", 3072),
+        help="Max input tokens for HF backend truncation (default: config.HF_MAX_INPUT_TOKENS).",
+    )
+    parser.add_argument(
+        "--hf-trust-remote-code",
+        action="store_true",
+        default=getattr(config, "HF_TRUST_REMOTE_CODE", False),
+        help="Allow trust_remote_code for HF model/tokenizer load (default: config.HF_TRUST_REMOTE_CODE).",
+    )
     parser.add_argument("--out", default=KPI_ENTITIES_FILE, help="Output parquet path (default: DATA/kpi_entities.parquet).")
     parser.add_argument("--workers", type=int, default=2, help="Parallel workers (default: 2).")
     parser.add_argument("--max-snippets", type=int, default=0, help="Process only first N new snippets (0 = all).")
@@ -983,6 +1216,11 @@ def main():
     )
     args = parser.parse_args()
 
+    provider = (getattr(args, "provider", None) or getattr(config, "LLM_PROVIDER", "ollama") or "ollama").strip().lower()
+    model = args.model
+    if provider == "hf":
+        model = args.hf_model or model
+
     max_snippets = args.max_snippets if args.max_snippets and args.max_snippets > 0 else None
     prompt_style = args.prompt_style
     filter_kpi = bool(args.filter_kpi)
@@ -998,7 +1236,7 @@ def main():
         save_every = max(int(save_every), 100)
 
     process_snippets(
-        model=args.model,
+        model=model,
         out_path=args.out,
         max_workers=workers,
         max_snippets=max_snippets,
@@ -1007,6 +1245,9 @@ def main():
         save_every=save_every,
         force=bool(args.force),
         prompt_style=prompt_style,
+        provider=provider,
+        hf_max_input_tokens=getattr(args, "hf_max_input_tokens", None),
+        hf_trust_remote_code=bool(getattr(args, "hf_trust_remote_code", False)),
     )
 
 if __name__ == "__main__":

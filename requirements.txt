@@ -24,3 +24,7 @@ sentence-transformers
 hdbscan
 rapidfuzz
 scikit-learn
+transformers
+accelerate
+huggingface-hub
+safetensors
