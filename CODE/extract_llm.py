@@ -34,6 +34,12 @@ except Exception:  # pragma: no cover
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
+try:
+    from vllm import LLM, SamplingParams  # type: ignore
+except Exception:  # pragma: no cover
+    LLM = None
+    SamplingParams = None
+
 # Output File
 KPI_ENTITIES_FILE = os.path.join(config.DATA_DIR, "kpi_entities.parquet")
 
@@ -397,10 +403,16 @@ def clean_json_response(response_text):
 
 _HF_MODEL = None
 _HF_TOKENIZER = None
+_VLLM_LLM = None
+_VLLM_TOKENIZER = None
 
 
 def _hf_available() -> bool:
     return torch is not None and AutoModelForCausalLM is not None and AutoTokenizer is not None
+
+
+def _vllm_available() -> bool:
+    return LLM is not None and SamplingParams is not None and AutoTokenizer is not None
 
 
 def _hf_device() -> str:
@@ -455,6 +467,55 @@ def _hf_load_model(model_name: str, trust_remote_code: bool = False):
     return _HF_MODEL, _HF_TOKENIZER
 
 
+def _vllm_load(model_name: str, trust_remote_code: bool = False):
+    """
+    Lazy-load a vLLM engine + tokenizer for high-throughput local GPU inference.
+    """
+    global _VLLM_LLM, _VLLM_TOKENIZER
+    if _VLLM_LLM is not None and _VLLM_TOKENIZER is not None:
+        return _VLLM_LLM, _VLLM_TOKENIZER
+
+    if not _vllm_available():
+        raise RuntimeError("vLLM backend requires `vllm` + `transformers` installed in this environment.")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tp = int(getattr(config, "VLLM_TENSOR_PARALLEL_SIZE", 1) or 1)
+    max_model_len = int(getattr(config, "HF_MAX_MODEL_LEN", 4096) or 4096)
+    gpu_mem = float(getattr(config, "VLLM_GPU_MEMORY_UTILIZATION", 0.90) or 0.90)
+
+    llm = LLM(
+        model=model_name,
+        trust_remote_code=trust_remote_code,
+        tensor_parallel_size=tp,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_mem,
+    )
+
+    _VLLM_LLM = llm
+    _VLLM_TOKENIZER = tokenizer
+    return _VLLM_LLM, _VLLM_TOKENIZER
+
+
+def _build_chat_prompt_if_supported(tokenizer, user_content: str) -> str:
+    """
+    Many instruction models behave better when using chat templates (JSON adherence).
+    If not supported, fall back to raw prompt text.
+    """
+    try:
+        if hasattr(tokenizer, "apply_chat_template"):
+            messages = [
+                {"role": "system", "content": "You are a precise information extraction engine. Output ONLY valid JSON."},
+                {"role": "user", "content": user_content},
+            ]
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        pass
+    return user_content
+
+
 def extract_from_snippet_hf(
     text: str,
     model: str,
@@ -506,6 +567,94 @@ def extract_from_snippet_hf(
     if not _validate_payload(payload):
         return None
     return payload
+
+
+def extract_from_snippet_vllm(
+    text: str,
+    model: str,
+    num_predict: int = 512,
+    prompt_style: str = "full",
+    trust_remote_code: bool = False,
+):
+    """
+    Extract structured JSON using vLLM for faster GPU throughput.
+    Returns payload dict or None.
+    """
+    tpl = PROMPT_TEMPLATE if (prompt_style or "full") == "full" else COMPACT_PROMPT_TEMPLATE
+    base_prompt = tpl.format(text=text)
+
+    llm, tokenizer = _vllm_load(model, trust_remote_code=trust_remote_code)
+    prompt = _build_chat_prompt_if_supported(tokenizer, base_prompt)
+
+    sampling = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=int(num_predict),
+    )
+    out = llm.generate([prompt], sampling_params=sampling)
+    if not out or not out[0].outputs:
+        return None
+    raw_response = out[0].outputs[0].text
+
+    cleaned_text = clean_json_response(raw_response)
+    try:
+        payload = json.loads(cleaned_text)
+    except Exception:
+        return None
+    if not _validate_payload(payload):
+        return None
+    return payload
+
+
+def extract_many_vllm(
+    texts: List[str],
+    model: str,
+    num_predict: int = 512,
+    prompt_style: str = "full",
+    trust_remote_code: bool = False,
+) -> List[Optional[dict]]:
+    """
+    Batch extraction using vLLM.generate() for better GPU utilization.
+    Returns payloads aligned to input texts (payload dict or None).
+    """
+    if not texts:
+        return []
+
+    tpl = PROMPT_TEMPLATE if (prompt_style or "full") == "full" else COMPACT_PROMPT_TEMPLATE
+    llm, tokenizer = _vllm_load(model, trust_remote_code=trust_remote_code)
+
+    prompts: List[str] = []
+    for t in texts:
+        base_prompt = tpl.format(text=t)
+        prompts.append(_build_chat_prompt_if_supported(tokenizer, base_prompt))
+
+    sampling = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=int(num_predict),
+    )
+    outputs = llm.generate(prompts, sampling_params=sampling)
+
+    payloads: List[Optional[dict]] = []
+    for out in outputs:
+        raw = out.outputs[0].text if out.outputs else ""
+        cleaned = clean_json_response(raw)
+        try:
+            payload = json.loads(cleaned)
+        except Exception:
+            payloads.append(None)
+            continue
+        if not _validate_payload(payload):
+            payloads.append(None)
+            continue
+        payloads.append(payload)
+
+    if len(payloads) != len(texts):
+        if len(payloads) < len(texts):
+            payloads.extend([None] * (len(texts) - len(payloads)))
+        else:
+            payloads = payloads[: len(texts)]
+    return payloads
 
 def extract_from_snippet(text: str, model: str, num_predict: int = 512, prompt_style: str = "full"):
     """Extract structured data from text using LLM with optimized settings."""
@@ -617,6 +766,14 @@ def process_single_row(
                 num_predict=num_predict,
                 prompt_style=prompt_style,
                 max_input_tokens=hf_max_input_tokens,
+                trust_remote_code=bool(hf_trust_remote_code),
+            )
+        elif extract_fn is extract_from_snippet_vllm:
+            data = extract_fn(
+                text,
+                model,
+                num_predict=num_predict,
+                prompt_style=prompt_style,
                 trust_remote_code=bool(hf_trust_remote_code),
             )
         else:
@@ -965,6 +1122,7 @@ def process_snippets(
     provider: str = "ollama",
     hf_max_input_tokens: Optional[int] = None,
     hf_trust_remote_code: bool = False,
+    hf_backend: str = "transformers",
 ):
     """Process all snippets to extract structured data, filtering already processed ones."""
     if not os.path.exists(config.SNIPPETS_FILE):
@@ -1040,6 +1198,7 @@ def process_snippets(
     meta_only = 0
     
     provider = (provider or "ollama").strip().lower()
+    hf_backend = (hf_backend or getattr(config, "HF_BACKEND", "transformers") or "transformers").strip().lower()
     extract_fn = extract_from_snippet
 
     if provider == "ollama":
@@ -1054,10 +1213,17 @@ def process_snippets(
             print("Error: Ollama is not running. Please install and start Ollama.")
             return
     elif provider == "hf":
-        extract_fn = extract_from_snippet_hf
-        if not _hf_available():
-            print("Error: HF backend requires `torch` + `transformers` installed in this environment.")
-            return
+        if hf_backend == "vllm":
+            extract_fn = extract_from_snippet_vllm
+            if not _vllm_available():
+                print("Error: vLLM backend requires `vllm` + `transformers` installed in this environment.")
+                return
+        else:
+            extract_fn = extract_from_snippet_hf
+            if not _hf_available():
+                print("Error: HF backend requires `torch` + `transformers` installed in this environment.")
+                return
+
         if max_workers and int(max_workers) > 1:
             print("[WARN] HF backend runs most reliably with --workers 1; forcing workers=1.")
             max_workers = 1
@@ -1075,38 +1241,126 @@ def process_snippets(
     
     if int(max_workers) <= 1:
         # Sequential execution (more stable for HF backend).
-        for _, row in tqdm(df_new.iterrows(), total=len(df_new), desc="Extracting Intelligence"):
-            try:
-                batch_results = process_single_row(
-                    row,
+        if provider == "hf" and hf_backend == "vllm":
+            # Batch prompts for better GPU utilization.
+            batch_size = int(getattr(config, "HF_BATCH_SIZE", 1) or 1)
+            batch_size = max(1, batch_size)
+
+            rows = list(df_new.itertuples(index=False))
+            for start_i in tqdm(range(0, len(rows), batch_size), total=(len(rows) + batch_size - 1) // batch_size, desc="Extracting Intelligence"):
+                chunk = rows[start_i : start_i + batch_size]
+                texts = [getattr(r, "text", "") for r in chunk]
+                payloads = extract_many_vllm(
+                    texts=texts,
                     model=model,
                     num_predict=num_predict,
                     prompt_style=prompt_style,
-                    extract_fn=extract_fn,
-                    hf_max_input_tokens=hf_max_input_tokens,
-                    hf_trust_remote_code=bool(hf_trust_remote_code),
+                    trust_remote_code=bool(hf_trust_remote_code),
                 )
-                if (
-                    len(batch_results) == 1
-                    and isinstance(batch_results[0], dict)
-                    and batch_results[0].get("category") == "Meta"
-                ):
-                    meta_only += 1
-                results.extend(batch_results)
-                completed += 1
-                if save_every and completed % int(save_every) == 0:
-                    new_results_df = pd.DataFrame(results)
-                    checkpoint_rows = _write_checkpoint(existing_df, new_results_df, out_path)
-                    elapsed = max(time.time() - started, 1e-6)
-                    rate = completed / elapsed
-                    remaining = len(df_new) - completed
-                    eta_min = (remaining / rate) / 60.0 if rate > 0 else float("inf")
-                    print(
-                        f"[INFO] checkpoint: {completed}/{len(df_new)} snippets, rows={checkpoint_rows}, "
-                        f"failures={failures}, meta_only={meta_only}, eta~{eta_min:.1f}m"
+                for r, payload in zip(chunk, payloads):
+                    row_dict = {
+                        "snippet_id": getattr(r, "snippet_id"),
+                        "text": getattr(r, "text"),
+                        "text_hash": getattr(r, "text_hash", None),
+                    }
+                    try:
+                        if payload is None:
+                            batch_results = [
+                                {
+                                    "snippet_id": row_dict["snippet_id"],
+                                    "entity_name": None,
+                                    "entity_type": None,
+                                    "industry": "Unknown",
+                                    "category": "Meta",
+                                    "detail_type": "Error",
+                                    "detail_value": "no_json",
+                                    "stance": 0.0,
+                                    "confidence": 0.0,
+                                }
+                            ]
+                        else:
+                            # Reuse existing shaping logic.
+                            original = extract_from_snippet_hf
+                            try:
+                                extract_from_snippet_hf = lambda _t, _m, num_predict=512, prompt_style="full", max_input_tokens=None, trust_remote_code=False: payload  # type: ignore
+                                batch_results = process_single_row(
+                                    row_dict,
+                                    model=model,
+                                    num_predict=num_predict,
+                                    prompt_style=prompt_style,
+                                    extract_fn=extract_from_snippet_hf,
+                                )
+                            finally:
+                                extract_from_snippet_hf = original
+                    except Exception:
+                        failures += 1
+                        batch_results = [
+                            {
+                                "snippet_id": row_dict["snippet_id"],
+                                "entity_name": None,
+                                "entity_type": None,
+                                "industry": "Unknown",
+                                "category": "Meta",
+                                "detail_type": "Error",
+                                "detail_value": "exception",
+                                "stance": 0.0,
+                                "confidence": 0.0,
+                            }
+                        ]
+
+                    if (
+                        len(batch_results) == 1
+                        and isinstance(batch_results[0], dict)
+                        and batch_results[0].get("category") == "Meta"
+                    ):
+                        meta_only += 1
+                    results.extend(batch_results)
+                    completed += 1
+
+                    if save_every and completed % int(save_every) == 0:
+                        new_results_df = pd.DataFrame(results)
+                        checkpoint_rows = _write_checkpoint(existing_df, new_results_df, out_path)
+                        elapsed = max(time.time() - started, 1e-6)
+                        rate = completed / elapsed
+                        remaining = len(df_new) - completed
+                        eta_min = (remaining / rate) / 60.0 if rate > 0 else float("inf")
+                        print(
+                            f"[INFO] checkpoint: {completed}/{len(df_new)} snippets, rows={checkpoint_rows}, "
+                            f"failures={failures}, meta_only={meta_only}, eta~{eta_min:.1f}m"
+                        )
+        else:
+            for _, row in tqdm(df_new.iterrows(), total=len(df_new), desc="Extracting Intelligence"):
+                try:
+                    batch_results = process_single_row(
+                        row,
+                        model=model,
+                        num_predict=num_predict,
+                        prompt_style=prompt_style,
+                        extract_fn=extract_fn,
+                        hf_max_input_tokens=hf_max_input_tokens,
+                        hf_trust_remote_code=bool(hf_trust_remote_code),
                     )
-            except Exception:
-                failures += 1
+                    if (
+                        len(batch_results) == 1
+                        and isinstance(batch_results[0], dict)
+                        and batch_results[0].get("category") == "Meta"
+                    ):
+                        meta_only += 1
+                    results.extend(batch_results)
+                    completed += 1
+                    if save_every and completed % int(save_every) == 0:
+                        new_results_df = pd.DataFrame(results)
+                        checkpoint_rows = _write_checkpoint(existing_df, new_results_df, out_path)
+                        elapsed = max(time.time() - started, 1e-6)
+                        rate = completed / elapsed
+                        remaining = len(df_new) - completed
+                        eta_min = (remaining / rate) / 60.0 if rate > 0 else float("inf")
+                        print(
+                            f"[INFO] checkpoint: {completed}/{len(df_new)} snippets, rows={checkpoint_rows}, "
+                            f"failures={failures}, meta_only={meta_only}, eta~{eta_min:.1f}m"
+                        )
+                except Exception:
+                    failures += 1
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
@@ -1196,6 +1450,12 @@ def main():
         default=getattr(config, "HF_TRUST_REMOTE_CODE", False),
         help="Allow trust_remote_code for HF model/tokenizer load (default: config.HF_TRUST_REMOTE_CODE).",
     )
+    parser.add_argument(
+        "--hf-backend",
+        choices=["transformers", "vllm"],
+        default=getattr(config, "HF_BACKEND", "transformers"),
+        help="HF inference backend (default: config.HF_BACKEND). Use vllm for higher throughput on GPU.",
+    )
     parser.add_argument("--out", default=KPI_ENTITIES_FILE, help="Output parquet path (default: DATA/kpi_entities.parquet).")
     parser.add_argument("--workers", type=int, default=2, help="Parallel workers (default: 2).")
     parser.add_argument("--max-snippets", type=int, default=0, help="Process only first N new snippets (0 = all).")
@@ -1248,6 +1508,7 @@ def main():
         provider=provider,
         hf_max_input_tokens=getattr(args, "hf_max_input_tokens", None),
         hf_trust_remote_code=bool(getattr(args, "hf_trust_remote_code", False)),
+        hf_backend=getattr(args, "hf_backend", getattr(config, "HF_BACKEND", "transformers")),
     )
 
 if __name__ == "__main__":

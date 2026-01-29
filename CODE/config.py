@@ -190,11 +190,14 @@ LLM_MODEL = "llama3.1"
 # Hugging Face (local) LLM configuration (optional, used when LLM_PROVIDER="hf" or extract_llm.py --provider hf)
 # Defaults favor broad availability; override via env/CLI on HPC (e.g., Qwen2.5-14B/32B) for higher accuracy.
 HF_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-HF_BACKEND = os.getenv("HF_BACKEND", "transformers")  # transformers | vllm (vllm not implemented here yet)
+HF_BACKEND = os.getenv("HF_BACKEND", "transformers")  # transformers | vllm
 HF_TRUST_REMOTE_CODE = os.getenv("HF_TRUST_REMOTE_CODE", "0").strip() in {"1", "true", "True", "yes", "YES"}
 HF_DEVICE = os.getenv("HF_DEVICE", "auto")  # auto | cpu | cuda
 HF_MAX_INPUT_TOKENS = int(os.getenv("HF_MAX_INPUT_TOKENS", "3072"))
 HF_BATCH_SIZE = int(os.getenv("HF_BATCH_SIZE", "1"))
+HF_MAX_MODEL_LEN = int(os.getenv("HF_MAX_MODEL_LEN", "4096"))
+VLLM_TENSOR_PARALLEL_SIZE = int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1"))
+VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90"))
 
 # Entity Deduplication
 FUZZY_THRESHOLD = 90

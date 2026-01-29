@@ -28,3 +28,4 @@ transformers
 accelerate
 huggingface-hub
 safetensors
+vllm; platform_system == "Linux"

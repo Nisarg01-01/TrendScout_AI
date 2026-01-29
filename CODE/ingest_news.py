@@ -41,6 +41,12 @@ _BOILERPLATE_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bCrunchboard\b", re.IGNORECASE),
     re.compile(r"\bNewsletters\b", re.IGNORECASE),
     re.compile(r"\bPartner Content\b", re.IGNORECASE),
+    # Common “subscribe / related links” blocks that pollute extracted HTML.
+    re.compile(r"\bBy submitting your email\b", re.IGNORECASE),
+    re.compile(r"\bTerms and Privacy Notice\b", re.IGNORECASE),
+    re.compile(r"\bPrivacy Notice\b", re.IGNORECASE),
+    re.compile(r"\bSubscribe\b", re.IGNORECASE),
+    re.compile(r"\bRelated\b", re.IGNORECASE),
 ]
 
 
@@ -56,10 +62,25 @@ def _text_quality_score(text: str) -> float:
     t = _normalize_text(text)
     if not t:
         return 0.0
+
+    # Hard fail: newsletter subscribe blocks are not article content, even if long.
+    t_l = t.lower()
+    if "by submitting your email" in t_l and "privacy" in t_l:
+        return 0.0
+    if "terms and privacy notice" in t_l and "subscribe" in t_l:
+        return 0.0
+
     penalty = 0.0
     for pat in _BOILERPLATE_PATTERNS:
         if pat.search(t):
-            penalty += 0.2
+            # Some patterns are mild, some are strong indicators of non-article text.
+            p = pat.pattern.lower()
+            if "by submitting your email" in p or "terms and privacy notice" in p:
+                penalty += 0.5
+            elif "subscribe" in p or "related" in p:
+                penalty += 0.35
+            else:
+                penalty += 0.2
     # Penalize extremely long "menu-like" blobs with very low punctuation density.
     punct = sum(1 for ch in t if ch in ".?!;:")
     if len(t) > 1200 and punct / max(1, len(t)) < 0.002:

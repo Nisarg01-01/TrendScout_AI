@@ -24,9 +24,17 @@ def clean_text(text: str) -> str:
         "Site Search",
         "Crunchboard",
         "Loading the player",
+        "By submitting your email",
+        "Terms and Privacy Notice",
+        "Privacy Notice",
     ]
     for p in boilerplate_phrases:
         t = re.sub(re.escape(p), " ", t, flags=re.IGNORECASE)
+
+    # Drop common “subscribe/related” blocks that can slip into HTML extraction.
+    t = re.sub(r"(?i)\bby submitting your email\b.*?(?=(\bRelated\b|$))", " ", t)
+    t = re.sub(r"(?i)\bRelated\b\s+.*$", " ", t)
+    t = re.sub(r"(?i)\bsubscribe\b\s+.*?(?=$)", " ", t)
 
     t = re.sub(r"\s+", " ", t).strip()
     return t

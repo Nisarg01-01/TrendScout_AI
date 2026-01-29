@@ -101,3 +101,9 @@ If you want to run extraction on an HPC GPU node without relying on Ollama, you 
 ```bash
 python CODE/extract_llm.py --provider hf --hf-model Qwen/Qwen2.5-14B-Instruct --out DATA/kpi_entities.parquet
 ```
+
+For higher throughput on GPUs, you can use vLLM (recommended on HPC):
+
+```bash
+python CODE/extract_llm.py --provider hf --hf-backend vllm --hf-model Qwen/Qwen2.5-14B-Instruct --out DATA/kpi_entities.parquet
+```
