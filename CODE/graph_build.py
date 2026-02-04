@@ -185,6 +185,47 @@ class GraphBuilder:
             return True
         return False
 
+    def _entity_type_priority(self, raw_type: str) -> int:
+        """
+        Normalize and assign a priority to entity types.
+
+        Higher priority wins when an entity appears with multiple types across snippets.
+        This helps prevent common issues where something like "FBI" is first seen as
+        "Organization" and never corrected to "GovernmentAgency".
+        """
+        t = str(raw_type or "").strip()
+        if not t:
+            return 0
+        low = t.lower()
+
+        # Strong exclusions (should override generic "Organization").
+        if "person" in low or low == "name":
+            return 90
+        if "government" in low or "agency" in low:
+            return 80
+        if low in {"country"} or "country" in low:
+            return 70
+        if "location" in low:
+            return 60
+        if "event" in low:
+            return 55
+
+        # Products/software are usually not what we want to rank as "startups".
+        if "product" in low or "software" in low or "website" in low or "language" in low:
+            return 40
+
+        # Positive business entities.
+        if "company" in low:
+            return 30
+        if "startup" in low:
+            return 25
+        if "investor" in low:
+            return 20
+        if "organization" in low or low in {"org"}:
+            return 10
+
+        return 1
+
     def build_graph(self):
         """Build knowledge graph by creating nodes and edges from extracted data.
         Creates Article, Entity, Industry, Snippet, and KPI nodes with relationships.
@@ -375,10 +416,12 @@ class GraphBuilder:
                             continue
                         if self._is_junk_entity_name(name):
                             continue
+                        etype = str(er.get("entity_type", "") or "Unknown")
                         entities_to_batch.append(
                             {
                                 "name": name,
-                                "type": str(er.get("entity_type", "") or "Unknown"),
+                                "type": etype,
+                                "type_pri": int(self._entity_type_priority(etype)),
                                 "stance": float(er.get("stance", 0.0) or 0.0),
                             }
                         )
@@ -391,7 +434,10 @@ class GraphBuilder:
                             MATCH (a:Article {id: $article_id})
                             UNWIND $entities AS ent
                             MERGE (e:Entity {name: ent.name})
-                            ON CREATE SET e.type = ent.type
+                            ON CREATE SET e.type = ent.type, e.type_priority = ent.type_pri
+                            ON MATCH SET
+                                e.type = CASE WHEN coalesce(e.type_priority, 0) < ent.type_pri THEN ent.type ELSE e.type END,
+                                e.type_priority = CASE WHEN coalesce(e.type_priority, 0) < ent.type_pri THEN ent.type_pri ELSE e.type_priority END
                             MERGE (a)-[r:MENTIONS]->(e)
                             SET r.stance = ent.stance
                             """,

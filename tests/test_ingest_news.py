@@ -58,3 +58,17 @@ class TestIngestNews(unittest.TestCase):
         self.assertTrue(row["article_id"])
         self.assertEqual(row["text"], "Full article body")
         self.assertEqual(row["canonical_url"], "https://example.com/a")
+
+    def test_should_skip_full_text_fetch_for_techcrunch_video(self):
+        self.assertTrue(
+            ingest_news._should_skip_full_text_fetch(
+                "https://techcrunch.com/video/spacex-is-coming-to-the-public-markets-and-secondaries-are-already-on-fire/"
+            )
+        )
+
+    @patch.object(ingest_news, "requests", autospec=True)
+    def test_fetch_full_text_skips_request_when_url_is_skipped(self, mock_requests):
+        # If the URL is in the skip list, we should not attempt any HTTP request.
+        mock_requests.get.side_effect = AssertionError("requests.get should not be called for skipped URLs")
+        txt = ingest_news.fetch_full_text("https://techcrunch.com/video/some-video/")
+        self.assertEqual(txt, "")

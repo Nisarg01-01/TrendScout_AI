@@ -6,6 +6,7 @@ import shutil
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+import argparse
 
 
 class RAGIndexer:
@@ -31,7 +32,7 @@ class RAGIndexer:
         except Exception:
             return None
 
-    def index_snippets(self):
+    def index_snippets(self, *, rebuild: bool = False, max_workers: int = 4):
         """Generate embeddings for new snippets and save to parquet file."""
         if not os.path.exists(config.SNIPPETS_FILE):
             print("No snippets file found.")
@@ -43,6 +44,16 @@ class RAGIndexer:
 
         existing_ids = set()
         existing_df = pd.DataFrame()
+
+        if rebuild and os.path.exists(self.output_file):
+            bak = self._backup_embeddings()
+            if bak:
+                print(f"[INFO] --rebuild enabled. Backup written: {bak}")
+            try:
+                os.remove(self.output_file)
+                print(f"[INFO] Removed existing embeddings file: {self.output_file}")
+            except Exception as e:
+                raise SystemExit(f"Failed to remove existing embeddings file: {e}")
 
         if os.path.exists(self.output_file):
             try:
@@ -70,9 +81,8 @@ class RAGIndexer:
 
         print(f"Indexing {len(df_new)} new snippets...")
 
-        MAX_WORKERS = 4
         embeddings = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=int(max_workers) if int(max_workers) > 0 else 1) as executor:
             for emb in tqdm(
                 executor.map(self.generate_embedding, df_new['text']),
                 total=len(df_new),
@@ -100,5 +110,14 @@ class RAGIndexer:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Create/update snippet embeddings parquet (incremental by default).")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Delete DATA/snippets_embeddings.parquet before indexing (writes a .bak_* backup first).",
+    )
+    parser.add_argument("--workers", type=int, default=4, help="Embedding workers (default: 4).")
+    args = parser.parse_args()
+
     indexer = RAGIndexer()
-    indexer.index_snippets()
+    indexer.index_snippets(rebuild=bool(args.rebuild), max_workers=int(args.workers))

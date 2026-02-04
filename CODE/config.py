@@ -1,5 +1,6 @@
 import os
 from typing import Dict, List
+
 try:
     from dotenv import load_dotenv  # type: ignore
     from dotenv import dotenv_values  # type: ignore
@@ -115,16 +116,43 @@ elif _feeds_extra and _feeds_extra.strip():
 MAX_ENTRIES_PER_FEED = int(os.getenv("MAX_ENTRIES_PER_FEED", "50"))
 FETCH_FULL_TEXT = os.getenv("FETCH_FULL_TEXT", "1").strip() not in {"0", "false", "False", "no", "NO"}
 MIN_ARTICLE_TEXT_CHARS = int(os.getenv("MIN_ARTICLE_TEXT_CHARS", "400"))
+# Comma-separated URL substrings. If a canonical_url contains any of these, we will skip HTML full-text fetching
+# and fall back to RSS summary. This avoids polluting snippets with non-article pages (e.g., video landing pages).
+SKIP_FULL_TEXT_URL_PATTERNS: List[str] = [
+    s.strip() for s in os.getenv("SKIP_FULL_TEXT_URL_PATTERNS", "techcrunch.com/video/").split(",") if s.strip()
+]
 
 # Keywords for Filtering
 AI_KEYWORDS: List[str] = [
-    "artificial intelligence", "ai", "ai-powered", "ai-native",
-    "machine learning", "ml", "deep learning", "neural network",
-    "generative ai", "genai", "foundation model", "frontier model",
-    "large language model", "llm", "gpt", "copilot", "agentic",
-    "computer vision", "nlp", "multimodal", "autonomous",
-    "ai startup", "ai company", "ai tool", "ai platform",
-    "ai agent", "ai assistant", "autonomous agent", "agent swarm"
+    "artificial intelligence",
+    "ai",
+    "ai-powered",
+    "ai-native",
+    "machine learning",
+    "ml",
+    "deep learning",
+    "neural network",
+    "generative ai",
+    "genai",
+    "foundation model",
+    "frontier model",
+    "large language model",
+    "llm",
+    "gpt",
+    "copilot",
+    "agentic",
+    "computer vision",
+    "nlp",
+    "multimodal",
+    "autonomous",
+    "ai startup",
+    "ai company",
+    "ai tool",
+    "ai platform",
+    "ai agent",
+    "ai assistant",
+    "autonomous agent",
+    "agent swarm",
 ]
 
 # Business/Startup context: use these to avoid pulling in consumer "AI" noise.
@@ -198,6 +226,8 @@ HF_BATCH_SIZE = int(os.getenv("HF_BATCH_SIZE", "1"))
 HF_MAX_MODEL_LEN = int(os.getenv("HF_MAX_MODEL_LEN", "4096"))
 VLLM_TENSOR_PARALLEL_SIZE = int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1"))
 VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90"))
+VLLM_ENFORCE_EAGER = os.getenv("VLLM_ENFORCE_EAGER", "0").strip() in {"1", "true", "True", "yes", "YES"}
+VLLM_GUIDED_JSON = os.getenv("VLLM_GUIDED_JSON", "1").strip() in {"1", "true", "True", "yes", "YES"}
 
 # Entity Deduplication
 FUZZY_THRESHOLD = 90

@@ -5,8 +5,9 @@ from chromadb.config import Settings
 import config
 from tqdm import tqdm
 import numpy as np
+import argparse
 
-def load_parquet_to_chroma():
+def load_parquet_to_chroma(*, rebuild: bool = False):
     """
     Loads the pre-computed embeddings from Parquet into a local ChromaDB.
     This allows for fast, persistent vector search without keeping everything in memory.
@@ -26,12 +27,13 @@ def load_parquet_to_chroma():
     # Initialize ChromaDB
     client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
     
-    # Delete existing collection if we want a fresh start (optional, but good for consistency)
-    try:
-        client.delete_collection("trendscout_snippets")
-        print("Deleted existing collection to ensure fresh load.")
-    except Exception:
-        pass # Collection didn't exist
+    if rebuild:
+        # Delete existing collection if we want a fresh start.
+        try:
+            client.delete_collection("trendscout_snippets")
+            print("Deleted existing collection to ensure fresh load.")
+        except Exception:
+            pass  # Collection didn't exist
 
     collection = client.get_or_create_collection(name="trendscout_snippets")
 
@@ -55,7 +57,11 @@ def load_parquet_to_chroma():
             meta = {
                 "source": row['source'],
                 "published": str(row['published']),
-                "title": row['title'] if pd.notna(row['title']) else "Unknown"
+                "title": row['title'] if pd.notna(row['title']) else "Unknown",
+                # Optional but useful for citations / UI linking.
+                "link": row.get("link", "") if pd.notna(row.get("link", "")) else "",
+                "article_id": str(row.get("article_id", "")) if pd.notna(row.get("article_id", "")) else "",
+                "snippet_id": str(row.get("snippet_id", "")) if pd.notna(row.get("snippet_id", "")) else "",
             }
             metadatas.append(meta)
 
@@ -67,14 +73,26 @@ def load_parquet_to_chroma():
                 emb = emb.tolist()
             embeddings.append(emb)
 
-        collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )
+        # Prefer upsert for incremental runs (avoids errors on existing IDs).
+        if hasattr(collection, "upsert"):
+            collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
+        else:
+            try:
+                collection.add(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
+            except Exception as e:
+                raise SystemExit(
+                    f"Chroma collection does not support upsert and add() failed (likely due to duplicate IDs): {e}. "
+                    "Re-run with --rebuild to recreate the collection."
+                )
 
     print(f"Successfully loaded {len(df)} snippets into ChromaDB at {config.CHROMA_DB_PATH}")
 
 if __name__ == "__main__":
-    load_parquet_to_chroma()
+    parser = argparse.ArgumentParser(description="Load snippet embeddings parquet into ChromaDB.")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Delete and recreate the Chroma collection before loading embeddings.",
+    )
+    args = parser.parse_args()
+    load_parquet_to_chroma(rebuild=bool(args.rebuild))

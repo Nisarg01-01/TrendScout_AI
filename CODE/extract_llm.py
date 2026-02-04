@@ -190,7 +190,11 @@ JSON Structure:
 # while relying on downstream evidence guardrails for safety.
 COMPACT_PROMPT_TEMPLATE = """
 Extract structured, evidence-based signals from the snippet below.
-Return ONLY valid JSON (no markdown). Do not guess. If unsure, output empty lists and stance=0.
+Return ONLY valid JSON (no markdown). Do not guess.
+
+KPI rule (important): If the snippet explicitly mentions any concrete event (funding, acquisition, hiring/layoffs,
+partnership, product launch/release, lawsuit, regulation, breach, outage, pricing), include at least one KPI.
+For each KPI, `value_text` MUST be copied verbatim from the snippet (exact substring, <= ~80 chars).
 
 Snippet:
 \"\"\"{text}\"\"\"
@@ -314,10 +318,39 @@ def _pick_primary_entity(data: Dict[str, Any]) -> str:
 
 
 def _value_text_supported(snippet_text: str, value_text: str) -> bool:
+    def _norm(s: str) -> str:
+        # Normalize lightly for robust substring checks while still requiring "copy from snippet".
+        # - lowercase
+        # - normalize unicode quotes/dashes
+        # - collapse whitespace
+        # - remove most punctuation but keep alphanumerics/spaces/$/% to preserve amounts
+        x = _as_str(s).lower()
+        x = (
+            x.replace("“", '"')
+            .replace("”", '"')
+            .replace("’", "'")
+            .replace("–", "-")
+            .replace("—", "-")
+        )
+        x = re.sub(r"\s+", " ", x).strip()
+        x = re.sub(r"[^a-z0-9\s\$\%\-\.\,]", "", x)
+        x = re.sub(r"\s+", " ", x).strip()
+        return x
+
     vt = _as_str(value_text)
     if not vt:
         return False
-    return vt.lower() in _as_str(snippet_text).lower()
+
+    raw = _as_str(snippet_text)
+    if vt.lower() in raw.lower():
+        return True
+
+    # Fallback: normalized substring check to tolerate minor punctuation/whitespace differences.
+    vt_n = _norm(vt)
+    if not vt_n:
+        return False
+    raw_n = _norm(raw)
+    return vt_n in raw_n
 
 
 def _kpi_has_evidence(snippet_text: str, kpi_type: str, value_text: str) -> bool:
@@ -386,20 +419,71 @@ def _kpi_has_evidence(snippet_text: str, kpi_type: str, value_text: str) -> bool
 
     return True
 
-def clean_json_response(response_text):
-    """Extract JSON content from LLM response, removing markdown wrappers."""
-    
-    # Try to find JSON block with regex
-    match = re.search(r'\{.*\}', response_text, re.DOTALL)
+def clean_json_response(response_text: str) -> str:
+    """
+    Best-effort JSON extraction (legacy helper).
+
+    Prefer `parse_first_json_object()` for robust parsing that tolerates leading/trailing text.
+    """
+    if not response_text:
+        return ""
+
+    t = str(response_text).strip()
+    if "```json" in t:
+        try:
+            t = t.split("```json", 1)[1].split("```", 1)[0]
+        except Exception:
+            pass
+    elif "```" in t:
+        try:
+            t = t.split("```", 1)[1].split("```", 1)[0]
+        except Exception:
+            pass
+
+    # Greedy regex is intentionally a last resort.
+    match = re.search(r"\{.*\}", t, re.DOTALL)
     if match:
-        return match.group(0)
-    
-    # Fallback to markdown stripping
-    if "```json" in response_text:
-        response_text = response_text.split("```json")[1].split("```")[0]
-    elif "```" in response_text:
-        response_text = response_text.split("```")[1].split("```")[0]
-    return response_text.strip()
+        return match.group(0).strip()
+
+    return t.strip()
+
+
+def parse_first_json_object(response_text: str) -> Optional[dict]:
+    """
+    Parse the first JSON object found in `response_text`.
+
+    This avoids a common failure mode where the model returns:
+      - a valid JSON object, plus
+      - extra trailing text or another JSON blob.
+
+    We parse the first object and ignore everything after it.
+    """
+    if not response_text:
+        return None
+
+    candidates: List[str] = []
+    t = str(response_text).strip()
+    candidates.append(t)
+
+    cleaned = clean_json_response(t)
+    if cleaned and cleaned != t:
+        candidates.insert(0, cleaned)
+
+    decoder = json.JSONDecoder()
+    for cand in candidates:
+        if not cand:
+            continue
+
+        starts = [m.start() for m in re.finditer(r"\{", cand)]
+        for start in starts[:10]:
+            try:
+                obj, _end = decoder.raw_decode(cand[start:])
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                return obj
+
+    return None
 
 _HF_MODEL = None
 _HF_TOKENIZER = None
@@ -486,13 +570,29 @@ def _vllm_load(model_name: str, trust_remote_code: bool = False):
     max_model_len = int(getattr(config, "HF_MAX_MODEL_LEN", 4096) or 4096)
     gpu_mem = float(getattr(config, "VLLM_GPU_MEMORY_UTILIZATION", 0.90) or 0.90)
 
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=trust_remote_code,
-        tensor_parallel_size=tp,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_mem,
-    )
+    enforce_eager = bool(getattr(config, "VLLM_ENFORCE_EAGER", False))
+
+    llm_kwargs = {
+        "model": model_name,
+        "trust_remote_code": trust_remote_code,
+        "tensor_parallel_size": tp,
+        "max_model_len": max_model_len,
+        "gpu_memory_utilization": gpu_mem,
+        # Best-effort knobs (supported in newer vLLM versions).
+        "disable_log_stats": True,
+        "enforce_eager": enforce_eager,
+    }
+
+    try:
+        llm = LLM(**llm_kwargs)
+    except TypeError:
+        # Backward/forward compatibility: drop unknown args.
+        llm_kwargs.pop("disable_log_stats", None)
+        try:
+            llm = LLM(**llm_kwargs)
+        except TypeError:
+            llm_kwargs.pop("enforce_eager", None)
+            llm = LLM(**llm_kwargs)
 
     _VLLM_LLM = llm
     _VLLM_TOKENIZER = tokenizer
@@ -516,6 +616,30 @@ def _build_chat_prompt_if_supported(tokenizer, user_content: str) -> str:
     return user_content
 
 
+def _vllm_sampling_params(max_tokens: int) -> "SamplingParams":
+    """
+    Build vLLM SamplingParams with optional guided JSON decoding when supported.
+
+    Guided JSON greatly reduces extraction dropouts (Meta-only) by forcing the output
+    to be valid JSON that matches our extraction schema.
+    """
+    kwargs: Dict[str, Any] = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": int(max_tokens),
+    }
+
+    if bool(getattr(config, "VLLM_GUIDED_JSON", True)):
+        # vLLM supports guided decoding in newer versions; ignore if unavailable.
+        kwargs["guided_json"] = EXTRACTION_SCHEMA
+
+    try:
+        return SamplingParams(**kwargs)
+    except TypeError:
+        kwargs.pop("guided_json", None)
+        return SamplingParams(**kwargs)
+
+
 def extract_from_snippet_hf(
     text: str,
     model: str,
@@ -529,9 +653,10 @@ def extract_from_snippet_hf(
     Returns payload dict or None.
     """
     tpl = PROMPT_TEMPLATE if (prompt_style or "full") == "full" else COMPACT_PROMPT_TEMPLATE
-    prompt = tpl.format(text=text)
+    base_prompt = tpl.format(text=text)
 
     hf_model, hf_tokenizer = _hf_load_model(model, trust_remote_code=trust_remote_code)
+    prompt = _build_chat_prompt_if_supported(hf_tokenizer, base_prompt)
 
     max_in = int(max_input_tokens or getattr(config, "HF_MAX_INPUT_TOKENS", 3072))
     inputs = hf_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_in)
@@ -559,14 +684,96 @@ def extract_from_snippet_hf(
     gen_ids = output_ids[0][input_len:]
     raw_response = hf_tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-    cleaned_text = clean_json_response(raw_response)
-    try:
-        payload = json.loads(cleaned_text)
-    except Exception:
+    payload = parse_first_json_object(raw_response)
+    if payload is None:
         return None
     if not _validate_payload(payload):
         return None
     return payload
+
+
+def extract_many_hf(
+    texts: List[str],
+    model: str,
+    num_predict: int = 512,
+    prompt_style: str = "full",
+    max_input_tokens: Optional[int] = None,
+    trust_remote_code: bool = False,
+) -> List[Optional[dict]]:
+    """
+    Batch extraction using Hugging Face `generate()` to better utilize GPU.
+
+    Returns payloads aligned to input texts (payload dict or None).
+    """
+    if not texts:
+        return []
+
+    tpl = PROMPT_TEMPLATE if (prompt_style or "full") == "full" else COMPACT_PROMPT_TEMPLATE
+    hf_model, hf_tokenizer = _hf_load_model(model, trust_remote_code=trust_remote_code)
+
+    prompts: List[str] = []
+    for t in texts:
+        base_prompt = tpl.format(text=t)
+        prompts.append(_build_chat_prompt_if_supported(hf_tokenizer, base_prompt))
+
+    max_in = int(max_input_tokens or getattr(config, "HF_MAX_INPUT_TOKENS", 3072))
+    inputs = hf_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_in)
+
+    # Best-effort: move inputs to model device when not using device_map="auto".
+    try:
+        model_device = getattr(hf_model, "device", None)
+        if model_device is not None:
+            inputs = {k: v.to(model_device) for k, v in inputs.items()}
+    except Exception:
+        pass
+
+    gen_kwargs = {
+        "max_new_tokens": int(num_predict),
+        "do_sample": False,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "pad_token_id": getattr(hf_tokenizer, "eos_token_id", None),
+    }
+
+    with torch.no_grad():  # type: ignore[union-attr]
+        output_ids = hf_model.generate(**inputs, **gen_kwargs)
+
+    # Per-row input lengths (needed because we pad to max length in the batch).
+    input_lens: List[int] = []
+    try:
+        if "attention_mask" in inputs:
+            am = inputs["attention_mask"]
+            input_lens = [int(x) for x in am.sum(dim=1).tolist()]
+    except Exception:
+        input_lens = []
+    if not input_lens:
+        input_len_fallback = int(inputs["input_ids"].shape[-1])
+        input_lens = [input_len_fallback] * len(texts)
+
+    payloads: List[Optional[dict]] = []
+    for i in range(len(texts)):
+        try:
+            gen_ids = output_ids[i][input_lens[i] :]
+            raw_response = hf_tokenizer.decode(gen_ids, skip_special_tokens=True)
+        except Exception:
+            payloads.append(None)
+            continue
+
+        payload = parse_first_json_object(raw_response)
+        if payload is None:
+            payloads.append(None)
+            continue
+        if not _validate_payload(payload):
+            payloads.append(None)
+            continue
+        payloads.append(payload)
+
+    if len(payloads) != len(texts):
+        if len(payloads) < len(texts):
+            payloads.extend([None] * (len(texts) - len(payloads)))
+        else:
+            payloads = payloads[: len(texts)]
+    return payloads
 
 
 def extract_from_snippet_vllm(
@@ -586,20 +793,14 @@ def extract_from_snippet_vllm(
     llm, tokenizer = _vllm_load(model, trust_remote_code=trust_remote_code)
     prompt = _build_chat_prompt_if_supported(tokenizer, base_prompt)
 
-    sampling = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=int(num_predict),
-    )
+    sampling = _vllm_sampling_params(int(num_predict))
     out = llm.generate([prompt], sampling_params=sampling)
     if not out or not out[0].outputs:
         return None
     raw_response = out[0].outputs[0].text
 
-    cleaned_text = clean_json_response(raw_response)
-    try:
-        payload = json.loads(cleaned_text)
-    except Exception:
+    payload = parse_first_json_object(raw_response)
+    if payload is None:
         return None
     if not _validate_payload(payload):
         return None
@@ -628,20 +829,14 @@ def extract_many_vllm(
         base_prompt = tpl.format(text=t)
         prompts.append(_build_chat_prompt_if_supported(tokenizer, base_prompt))
 
-    sampling = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=int(num_predict),
-    )
+    sampling = _vllm_sampling_params(int(num_predict))
     outputs = llm.generate(prompts, sampling_params=sampling)
 
     payloads: List[Optional[dict]] = []
     for out in outputs:
         raw = out.outputs[0].text if out.outputs else ""
-        cleaned = clean_json_response(raw)
-        try:
-            payload = json.loads(cleaned)
-        except Exception:
+        payload = parse_first_json_object(raw)
+        if payload is None:
             payloads.append(None)
             continue
         if not _validate_payload(payload):
@@ -678,9 +873,10 @@ def extract_from_snippet(text: str, model: str, num_predict: int = 512, prompt_s
                 "top_p": 0.9,
             }
         )
-        raw_response = response['response']
-        cleaned_text = clean_json_response(raw_response)
-        payload = json.loads(cleaned_text)
+        raw_response = response["response"]
+        payload = parse_first_json_object(raw_response)
+        if payload is None:
+            return None
         if not _validate_payload(payload):
             return None
         return payload
@@ -696,9 +892,10 @@ def extract_from_snippet(text: str, model: str, num_predict: int = 512, prompt_s
                 format="json",
                 options={"temperature": 0.1, "num_predict": int(num_predict)},
             )
-            raw_response = response['response']
-            cleaned_text = clean_json_response(raw_response)
-            payload = json.loads(cleaned_text)
+            raw_response = response["response"]
+            payload = parse_first_json_object(raw_response)
+            if payload is None:
+                return None
             if not _validate_payload(payload):
                 return None
             return payload
@@ -737,6 +934,77 @@ def _looks_kpi_relevant(text: str) -> bool:
     ]
     return any(k in t for k in keywords)
 
+def _heuristic_kpis_from_text(
+    text: str,
+    *,
+    subject_entity: str,
+) -> List[Dict[str, Any]]:
+    """
+    Heuristic KPI fallback when the model outputs no KPIs.
+
+    This is intentionally conservative and only triggers on obvious keywords, producing
+    a verbatim `value_text` excerpt from the snippet.
+    """
+    raw = _as_str(text)
+    t = raw.lower()
+    if not raw or not t:
+        return []
+
+    def excerpt(m: re.Match, radius: int = 60, max_len: int = 120) -> str:
+        start = max(0, m.start() - radius)
+        end = min(len(raw), m.end() + radius)
+        s = raw[start:end].strip()
+        s = re.sub(r"\s+", " ", s).strip()
+        if len(s) > max_len:
+            s = s[:max_len].rstrip()
+        return s
+
+    # Ordered by "signaliness"
+    rules: List[tuple[str, str, float, float]] = [
+        ("Funding", r"(?i)\b(raised|raise|funding|financing|series\s+[abcde]|seed)\b", 1.0, 0.55),
+        ("Acquisition", r"(?i)\b(acquired|acquisition|bought|purchase|purchased)\b", 1.0, 0.50),
+        ("Layoffs", r"(?i)\b(layoff|laid off|job cuts|furlough)\b", -1.0, 0.55),
+        ("Hiring", r"(?i)\b(hiring|hire|recruit|headcount|positions?)\b", 1.0, 0.45),
+        ("Partnership", r"(?i)\b(partner|partnership|collaborat|teamed up|joined forces)\b", 1.0, 0.45),
+        ("Lawsuit", r"(?i)\b(lawsuit|sued|litigation|complaint)\b", -1.0, 0.55),
+        ("Security", r"(?i)\b(breach|hacked|hack|leak|vulnerab)\b", -1.0, 0.55),
+        ("Outage", r"(?i)\b(outage|downtime|incident)\b", -1.0, 0.50),
+        ("Pricing", r"(?i)\b(pricing|price|fees|cost)\b", 0.0, 0.40),
+        ("Regulation", r"(?i)\b(regulat|ban|compliance|law)\b", 0.0, 0.40),
+        ("Product", r"(?i)\b(launched|launch|released|release|announced|unveil|rollout)\b", 1.0, 0.40),
+    ]
+
+    out: List[Dict[str, Any]] = []
+    for kpi_type, pat, polarity, conf in rules:
+        m = re.search(pat, raw)
+        if not m:
+            continue
+        vt = excerpt(m)
+        if not vt:
+            continue
+
+        # Funding: avoid false positives unless there is an amount hint.
+        if kpi_type == "Funding":
+            has_amount = bool(re.search(r"\$\s*[0-9]", raw)) or (" million" in t) or (" billion" in t)
+            if not has_amount:
+                kpi_type = "Other"
+                polarity = 0.0
+                conf = min(conf, 0.35)
+
+        out.append(
+            {
+                "type": kpi_type,
+                "entity": subject_entity or None,
+                "value_text": vt,
+                "polarity": polarity,
+                "confidence": conf,
+            }
+        )
+        # One KPI is enough to avoid "Meta-only" dropouts; keep it conservative.
+        break
+
+    return out
+
 
 def process_single_row(
     row,
@@ -747,12 +1015,11 @@ def process_single_row(
     hf_max_input_tokens: Optional[int] = None,
     hf_trust_remote_code: bool = False,
 ):
-    """Process article text to extract entities, KPIs, and SWOT data."""
+    """Process a snippet row to extract entities, KPIs, and SWOT data."""
     
     snippet_id = row["snippet_id"]
     text = row["text"]
     snippet_text_hash = _as_str(row.get("text_hash"))
-    local_results = []
 
     if extract_fn is None:
         extract_fn = extract_from_snippet
@@ -782,19 +1049,47 @@ def process_single_row(
         data = extract_fn(text, model, num_predict=num_predict)
     
     if not data:
-        return [
-            {
-                "snippet_id": snippet_id,
-                "entity_name": None,
-                "entity_type": None,
-                "industry": "Unknown",
-                "category": "Meta",
-                "detail_type": "Error",
-                "detail_value": "no_json",
-                "stance": 0.0,
-                "confidence": 0.0,
-            }
-        ]
+        return [_meta_row(snippet_id=snippet_id, snippet_text_hash=snippet_text_hash or None, industry="Unknown", stance=0.0, detail_type="Error", detail_value="no_json", confidence=0.0)]
+
+    return _rows_from_payload(
+        snippet_id=snippet_id,
+        text=text,
+        snippet_text_hash=snippet_text_hash or None,
+        data=data,
+    )
+
+
+def _meta_row(
+    snippet_id: Any,
+    snippet_text_hash: Optional[str],
+    industry: str,
+    stance: float,
+    detail_type: str,
+    detail_value: str,
+    confidence: float,
+) -> Dict[str, Any]:
+    return {
+        "snippet_id": snippet_id,
+        "snippet_text_hash": snippet_text_hash,
+        "entity_name": None,
+        "entity_type": None,
+        "industry": industry,
+        "category": "Meta",
+        "detail_type": detail_type,
+        "detail_value": detail_value,
+        "stance": stance,
+        "confidence": confidence,
+    }
+
+
+def _rows_from_payload(
+    *,
+    snippet_id: Any,
+    text: str,
+    snippet_text_hash: Optional[str],
+    data: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    local_results: List[Dict[str, Any]] = []
 
     industry_raw = data.get("industry", "Unknown")
     sector_raw = data.get("sector", "")
@@ -812,6 +1107,7 @@ def process_single_row(
         stance = 0.0
 
     primary_entity = _pick_primary_entity(data)
+    kpi_rows_added = 0
     
     # Add Entities
     for ent in data.get("entities", []):
@@ -875,8 +1171,9 @@ def process_single_row(
         if not _value_text_supported(text, kpi_value):
             continue
         if not _kpi_has_evidence(text, kpi_type, kpi_value):
-            # If it's not supported, drop it rather than polluting downstream graph/ranking.
-            continue
+            # If the type isn't supported but the evidence excerpt is real, downgrade to Other.
+            # This prevents "all KPI dropped" runs (no :HAS_KPI edges) while keeping quality high.
+            kpi_type = "Other"
         
         # Parse structured fields based on type
         if kpi_type == "Funding":
@@ -905,6 +1202,7 @@ def process_single_row(
                 "kpi_stage": _as_str(kpi_data.get("stage")),
                 "kpi_investors": json.dumps(kpi_data.get("investors", []) or []),
             })
+            kpi_rows_added += 1
             
         elif kpi_type == "Hiring":
             count_raw = kpi_data.get("count", 0)
@@ -931,6 +1229,7 @@ def process_single_row(
                 "kpi_roles": json.dumps(kpi_data.get("roles", []) or []),
                 "kpi_skills": json.dumps(kpi_data.get("skills", []) or []),
             })
+            kpi_rows_added += 1
 
         elif kpi_type == "Layoffs":
             count_raw = kpi_data.get("count", 0)
@@ -957,6 +1256,7 @@ def process_single_row(
                 "kpi_roles": json.dumps(kpi_data.get("roles", []) or []),
                 "kpi_skills": json.dumps(kpi_data.get("skills", []) or []),
             })
+            kpi_rows_added += 1
             
         elif kpi_type == "Partnership":
             local_results.append({
@@ -973,6 +1273,7 @@ def process_single_row(
                 "kpi_partner": _as_str(kpi_data.get("partner")),
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
+            kpi_rows_added += 1
 
         elif kpi_type == "Acquisition":
             local_results.append({
@@ -989,6 +1290,7 @@ def process_single_row(
                 "kpi_target": _as_str(kpi_data.get("target")),
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
+            kpi_rows_added += 1
 
         elif kpi_type == "Product":
             local_results.append({
@@ -1005,6 +1307,7 @@ def process_single_row(
                 "kpi_product_name": _as_str(kpi_data.get("name")),
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
+            kpi_rows_added += 1
 
         elif kpi_type == "Competition":
             local_results.append({
@@ -1021,6 +1324,7 @@ def process_single_row(
                 "kpi_competitor": _as_str(kpi_data.get("competitor")),
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
+            kpi_rows_added += 1
 
         elif kpi_type in {"Regulation", "Policy", "Lawsuit", "Security", "Outage", "Pricing"}:
             local_results.append({
@@ -1036,6 +1340,7 @@ def process_single_row(
                 "confidence": confidence,
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
+            kpi_rows_added += 1
             
         else:
             # Generic KPI
@@ -1052,6 +1357,56 @@ def process_single_row(
                 "confidence": confidence,
                 "kpi_description": _as_str(kpi_data.get("description")),
             })
+            kpi_rows_added += 1
+
+    # Heuristic fallback: if model yields no usable KPIs but the snippet looks KPI-like,
+    # add a single conservative KPI to avoid Meta-only and enable :HAS_KPI edges downstream.
+    if kpi_rows_added == 0 and _looks_kpi_relevant(text):
+        # Prefer primary entity; else fall back to the first extracted entity.
+        entity_names = [
+            r.get("entity_name")
+            for r in local_results
+            if isinstance(r, dict) and r.get("category") == "Entity" and r.get("entity_name")
+        ]
+        subj = _as_str(primary_entity) or (_as_str(entity_names[0]) if entity_names else "")
+        if subj and not _is_junk_entity_name(subj):
+            for hk in _heuristic_kpis_from_text(text, subject_entity=subj):
+                kpi_type = _as_str(hk.get("type")) or "Other"
+                kpi_value = _as_str(hk.get("value_text"))
+                if not kpi_value or not _value_text_supported(text, kpi_value):
+                    continue
+                # Keep the same evidence checks; downgrade if type guardrail doesn't match.
+                if not _kpi_has_evidence(text, kpi_type, kpi_value):
+                    kpi_type = "Other"
+                pol = hk.get("polarity", stance)
+                try:
+                    pol_f = float(pol) if pol is not None else stance
+                except Exception:
+                    pol_f = stance
+                conf = hk.get("confidence", 0.4)
+                try:
+                    conf_f = float(conf) if conf is not None else 0.4
+                except Exception:
+                    conf_f = 0.4
+                conf_f = max(0.0, min(1.0, conf_f))
+
+                local_results.append(
+                    {
+                        "snippet_id": snippet_id,
+                        "snippet_text_hash": snippet_text_hash or None,
+                        "entity_name": subj or None,
+                        "entity_type": None,
+                        "industry": industry,
+                        "category": "KPI",
+                        "detail_type": kpi_type,
+                        "detail_value": kpi_value,
+                        "stance": pol_f,
+                        "confidence": conf_f,
+                        "kpi_description": "",
+                    }
+                )
+                kpi_rows_added += 1
+                break
 
     # Add SWOT
     for swot in data.get("swot", []):
@@ -1082,18 +1437,15 @@ def process_single_row(
         
     if not local_results:
         return [
-            {
-                "snippet_id": snippet_id,
-                "snippet_text_hash": snippet_text_hash or None,
-                "entity_name": None,
-                "entity_type": None,
-                "industry": industry,
-                "category": "Meta",
-                "detail_type": "Empty",
-                "detail_value": "",
-                "stance": stance,
-                "confidence": 1.0,
-            }
+            _meta_row(
+                snippet_id=snippet_id,
+                snippet_text_hash=snippet_text_hash,
+                industry=industry,
+                stance=stance,
+                detail_type="Empty",
+                detail_value="",
+                confidence=1.0,
+            )
         ]
 
     return local_results
@@ -1266,46 +1618,117 @@ def process_snippets(
                     try:
                         if payload is None:
                             batch_results = [
-                                {
-                                    "snippet_id": row_dict["snippet_id"],
-                                    "entity_name": None,
-                                    "entity_type": None,
-                                    "industry": "Unknown",
-                                    "category": "Meta",
-                                    "detail_type": "Error",
-                                    "detail_value": "no_json",
-                                    "stance": 0.0,
-                                    "confidence": 0.0,
-                                }
+                                _meta_row(
+                                    snippet_id=row_dict["snippet_id"],
+                                    snippet_text_hash=_as_str(row_dict.get("text_hash")) or None,
+                                    industry="Unknown",
+                                    stance=0.0,
+                                    detail_type="Error",
+                                    detail_value="no_json",
+                                    confidence=0.0,
+                                )
                             ]
                         else:
-                            # Reuse existing shaping logic.
-                            original = extract_from_snippet_hf
-                            try:
-                                extract_from_snippet_hf = lambda _t, _m, num_predict=512, prompt_style="full", max_input_tokens=None, trust_remote_code=False: payload  # type: ignore
-                                batch_results = process_single_row(
-                                    row_dict,
-                                    model=model,
-                                    num_predict=num_predict,
-                                    prompt_style=prompt_style,
-                                    extract_fn=extract_from_snippet_hf,
-                                )
-                            finally:
-                                extract_from_snippet_hf = original
+                            batch_results = _rows_from_payload(
+                                snippet_id=row_dict["snippet_id"],
+                                text=row_dict["text"],
+                                snippet_text_hash=_as_str(row_dict.get("text_hash")) or None,
+                                data=payload,
+                            )
                     except Exception:
                         failures += 1
                         batch_results = [
-                            {
-                                "snippet_id": row_dict["snippet_id"],
-                                "entity_name": None,
-                                "entity_type": None,
-                                "industry": "Unknown",
-                                "category": "Meta",
-                                "detail_type": "Error",
-                                "detail_value": "exception",
-                                "stance": 0.0,
-                                "confidence": 0.0,
-                            }
+                            _meta_row(
+                                snippet_id=row_dict["snippet_id"],
+                                snippet_text_hash=_as_str(row_dict.get("text_hash")) or None,
+                                industry="Unknown",
+                                stance=0.0,
+                                detail_type="Error",
+                                detail_value="exception",
+                                confidence=0.0,
+                            )
+                        ]
+
+                    if (
+                        len(batch_results) == 1
+                        and isinstance(batch_results[0], dict)
+                        and batch_results[0].get("category") == "Meta"
+                    ):
+                        meta_only += 1
+                    results.extend(batch_results)
+                    completed += 1
+
+                    if save_every and completed % int(save_every) == 0:
+                        new_results_df = pd.DataFrame(results)
+                        checkpoint_rows = _write_checkpoint(existing_df, new_results_df, out_path)
+                        elapsed = max(time.time() - started, 1e-6)
+                        rate = completed / elapsed
+                        remaining = len(df_new) - completed
+                        eta_min = (remaining / rate) / 60.0 if rate > 0 else float("inf")
+                        print(
+                            f"[INFO] checkpoint: {completed}/{len(df_new)} snippets, rows={checkpoint_rows}, "
+                            f"failures={failures}, meta_only={meta_only}, eta~{eta_min:.1f}m"
+                        )
+        elif provider == "hf" and hf_backend == "transformers":
+            # Batch prompts for better GPU utilization.
+            batch_size = int(getattr(config, "HF_BATCH_SIZE", 1) or 1)
+            batch_size = max(1, batch_size)
+
+            rows = list(df_new.itertuples(index=False))
+            for start_i in tqdm(
+                range(0, len(rows), batch_size),
+                total=(len(rows) + batch_size - 1) // batch_size,
+                desc="Extracting Intelligence",
+            ):
+                chunk = rows[start_i : start_i + batch_size]
+                texts = [getattr(r, "text", "") for r in chunk]
+                payloads = extract_many_hf(
+                    texts=texts,
+                    model=model,
+                    num_predict=num_predict,
+                    prompt_style=prompt_style,
+                    max_input_tokens=hf_max_input_tokens,
+                    trust_remote_code=bool(hf_trust_remote_code),
+                )
+
+                for r, payload in zip(chunk, payloads):
+                    row_dict = {
+                        "snippet_id": getattr(r, "snippet_id"),
+                        "text": getattr(r, "text"),
+                        "text_hash": getattr(r, "text_hash", None),
+                    }
+                    try:
+                        if payload is None:
+                            batch_results = [
+                                _meta_row(
+                                    snippet_id=row_dict["snippet_id"],
+                                    snippet_text_hash=_as_str(row_dict.get("text_hash")) or None,
+                                    industry="Unknown",
+                                    stance=0.0,
+                                    detail_type="Error",
+                                    detail_value="no_json",
+                                    confidence=0.0,
+                                )
+                            ]
+                        else:
+                            batch_results = _rows_from_payload(
+                                snippet_id=row_dict["snippet_id"],
+                                text=row_dict["text"],
+                                snippet_text_hash=_as_str(row_dict.get("text_hash")) or None,
+                                data=payload,
+                            )
+                    except Exception:
+                        failures += 1
+                        batch_results = [
+                            _meta_row(
+                                snippet_id=row_dict["snippet_id"],
+                                snippet_text_hash=_as_str(row_dict.get("text_hash")) or None,
+                                industry="Unknown",
+                                stance=0.0,
+                                detail_type="Error",
+                                detail_value="exception",
+                                confidence=0.0,
+                            )
                         ]
 
                     if (
@@ -1463,6 +1886,7 @@ def main():
     parser.add_argument("--filter-kpi", action="store_true", help="Only process KPI-looking snippets (faster, higher recall than precision).")
     parser.add_argument("--save-every", type=int, default=25, help="Checkpoint after every N snippets (default: 25).")
     parser.add_argument("--force", action="store_true", help="Re-extract all snippets into a fresh output file (backs up existing parquet).")
+    parser.add_argument("--fresh", action="store_true", help="Alias for --force.")
     parser.add_argument(
         "--prompt-style",
         choices=["full", "compact"],
@@ -1503,7 +1927,7 @@ def main():
         num_predict=num_predict,
         filter_kpi=filter_kpi,
         save_every=save_every,
-        force=bool(args.force),
+        force=bool(args.force) or bool(args.fresh),
         prompt_style=prompt_style,
         provider=provider,
         hf_max_input_tokens=getattr(args, "hf_max_input_tokens", None),

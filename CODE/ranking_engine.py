@@ -63,9 +63,79 @@ class StartupRanker:
         if low.endswith(" company") or low.endswith(" companies"):
             return True
         return False
+
+    def _is_rankable_entity_type(self, entity_type: str) -> bool:
+        """
+        Heuristic filter: only rank company/org-like entities.
+
+        This is important because ingestion can pull countries, agencies, authors, etc.
+        into the text and the extractor may tag them as entities.
+        """
+        t = str(entity_type or "").strip()
+        if not t:
+            return True  # Don't drop if graph didn't store a type.
+        low = t.lower()
+
+        deny = {
+            "person",
+            "country",
+            "location",
+            "event",
+            "product",
+            "software",
+            "website",
+            "language",
+            "government",
+            "government organization",
+            "governmentagency",
+        }
+        if low in deny:
+            return False
+        if "government" in low or "agency" in low:
+            return False
+        if "country" in low or "location" in low:
+            return False
+        if "person" in low:
+            return False
+
+        allow = {
+            "company",
+            "organization",
+            "startup",
+            "investor",
+        }
+        if low in allow:
+            return True
+
+        # Default: keep unknown/custom labels (conservative).
+        return True
     
     def close(self):
         self.driver.close()
+
+    def _relationship_type_exists(self, rel_type: str) -> bool:
+        rt = str(rel_type or "").strip()
+        if not rt:
+            return False
+        with self.driver.session() as session:
+            try:
+                types: set[str] = set()
+                try:
+                    res = session.run("CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType AS t")
+                    types = {str(r["t"]) for r in res if r and r.get("t") is not None}
+                except Exception:
+                    res = session.run("CALL db.relationshipTypes()")
+                    for r in res:
+                        if isinstance(r, dict) and "relationshipType" in r:
+                            types.add(str(r["relationshipType"]))
+                        else:
+                            try:
+                                types.add(str(r[0]))
+                            except Exception:
+                                pass
+                return rt in types
+            except Exception:
+                return False
     
     def compute_centrality_per_cluster(self) -> Dict[int, Dict[str, float]]:
         """
@@ -80,19 +150,52 @@ class StartupRanker:
             # Get all clusters
             result = session.run("MATCH (c:Cluster) RETURN c.id as cluster_id")
             cluster_ids = [r['cluster_id'] for r in result]
+
+            # Fallback: if clusters are not built yet, compute a single global centrality.
+            # This keeps downstream ranking usable without community detection.
+            if not cluster_ids:
+                result = session.run("""
+                    MATCH (a:Article)-[:MENTIONS]->(e:Entity)
+                    RETURN a.id as article_id, e.name as entity_name, e.type as entity_type
+                """)
+
+                G = nx.Graph()
+                for record in result:
+                    aid = record.get("article_id")
+                    en = record.get("entity_name")
+                    et = record.get("entity_type")
+                    if not aid or not en or self._is_junk_entity_name(en) or not self._is_rankable_entity_type(et):
+                        continue
+                    G.add_edge(f"a_{aid}", f"e_{en}")
+
+                if G.number_of_nodes() > 0:
+                    try:
+                        pr = nx.pagerank(G, weight="weight")
+                        entity_scores = {k.replace("e_", ""): v for k, v in pr.items() if k.startswith("e_")}
+                        cluster_centrality[0] = entity_scores
+                    except Exception:
+                        cluster_centrality[0] = {}
+
+                print("[WARN] No :Cluster nodes found; computed global centrality in cluster_id=0.")
+                print(f"[OK] Computed centrality for {len(cluster_centrality)} clusters")
+                return cluster_centrality
             
             for cid in cluster_ids:
                 # Build subgraph for this cluster
                 # Articles in cluster + entities they mention
                 result = session.run("""
                     MATCH (c:Cluster {id: $cid})-[:HAS]->(a:Article)-[r:MENTIONS]->(e:Entity)
-                    RETURN a.id as article_id, e.name as entity_name, r.stance as stance
+                    RETURN a.id as article_id, e.name as entity_name, e.type as entity_type, r.stance as stance
                 """, {'cid': cid})
                 
                 # Build bipartite graph: Article <-> Entity
                 G = nx.Graph()
                 for record in result:
-                    G.add_edge(f"a_{record['article_id']}", f"e_{record['entity_name']}")
+                    en = record.get("entity_name")
+                    et = record.get("entity_type")
+                    if not en or self._is_junk_entity_name(en) or not self._is_rankable_entity_type(et):
+                        continue
+                    G.add_edge(f"a_{record['article_id']}", f"e_{en}")
                 
                 if G.number_of_nodes() == 0:
                     continue
@@ -129,6 +232,11 @@ class StartupRanker:
         now = datetime.now()
         
         with self.driver.session() as session:
+            # If KPI relationships are missing/empty, skip KPI scoring to avoid noisy Neo4j warnings.
+            if not self._relationship_type_exists("HAS_KPI"):
+                print("[WARN] No :HAS_KPI relationships found; KPI scores set to 0.")
+                return {}, {}, {}
+
             result = session.run("""
                 MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
                 MATCH (a)<-[:IN]-(s:Snippet)-[:ABOUT]->(k:KPI)
@@ -193,14 +301,26 @@ class StartupRanker:
         entity_investor_scores = defaultdict(lambda: defaultdict(float))
         
         with self.driver.session() as session:
-            result = session.run("""
-                MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
-                MATCH (e)-[:FUNDED_BY]->(i:Investor)
-                RETURN e.name as entity_name, c.id as cluster_id,
-                       avg(i.prestige) as avg_prestige,
-                       max(i.prestige) as max_prestige,
-                       count(i) as investor_count
-            """)
+            n = session.run("MATCH (c:Cluster) RETURN count(c) as n").single()
+            has_clusters = bool(n and (n.get("n") or 0) > 0)
+            if has_clusters:
+                result = session.run("""
+                    MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
+                    MATCH (e)-[:FUNDED_BY]->(i:Investor)
+                    RETURN e.name as entity_name, c.id as cluster_id,
+                           avg(i.prestige) as avg_prestige,
+                           max(i.prestige) as max_prestige,
+                           count(i) as investor_count
+                """)
+            else:
+                result = session.run("""
+                    MATCH (a:Article)-[:MENTIONS]->(e:Entity)
+                    MATCH (e)-[:FUNDED_BY]->(i:Investor)
+                    RETURN e.name as entity_name, 0 as cluster_id,
+                           avg(i.prestige) as avg_prestige,
+                           max(i.prestige) as max_prestige,
+                           count(i) as investor_count
+                """)
             
             for record in result:
                 entity = record['entity_name']
@@ -231,15 +351,29 @@ class StartupRanker:
         cutoff = now - timedelta(days=self.recency_window)
         
         with self.driver.session() as session:
-            result = session.run("""
-                MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
-                WHERE a.published IS NOT NULL AND a.published <> ""
-                RETURN e.name as entity_name, c.id as cluster_id, a.published as date
-            """)
+            n = session.run("MATCH (c:Cluster) RETURN count(c) as n").single()
+            has_clusters = bool(n and (n.get("n") or 0) > 0)
+            if has_clusters:
+                result = session.run("""
+                    MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
+                    WHERE a.published IS NOT NULL AND a.published <> ""
+                    RETURN e.name as entity_name, e.type as entity_type, c.id as cluster_id, a.published as date
+                """)
+            else:
+                result = session.run("""
+                    MATCH (a:Article)-[:MENTIONS]->(e:Entity)
+                    WHERE a.published IS NOT NULL AND a.published <> ""
+                    RETURN e.name as entity_name, e.type as entity_type, 0 as cluster_id, a.published as date
+                """)
             
             for record in result:
                 entity = record['entity_name']
+                etype = record.get("entity_type")
                 cid = record['cluster_id']
+                if self._is_junk_entity_name(entity):
+                    continue
+                if not self._is_rankable_entity_type(etype):
+                    continue
                 
                 try:
                     date_str = record['date']
@@ -272,15 +406,26 @@ class StartupRanker:
         
         # Get all entities per cluster
         with self.driver.session() as session:
-            result = session.run("""
-                MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
-                RETURN DISTINCT c.id as cluster_id, e.name as entity_name
-            """)
+            n = session.run("MATCH (c:Cluster) RETURN count(c) as n").single()
+            has_clusters = bool(n and (n.get("n") or 0) > 0)
+            if has_clusters:
+                result = session.run("""
+                    MATCH (c:Cluster)-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity)
+                    RETURN DISTINCT c.id as cluster_id, e.name as entity_name, e.type as entity_type
+                """)
+            else:
+                result = session.run("""
+                    MATCH (a:Article)-[:MENTIONS]->(e:Entity)
+                    RETURN DISTINCT 0 as cluster_id, e.name as entity_name, e.type as entity_type
+                """)
             
             for record in result:
                 entity = record['entity_name']
+                etype = record.get("entity_type")
                 cid = record['cluster_id']
                 if self._is_junk_entity_name(entity):
+                    continue
+                if not self._is_rankable_entity_type(etype):
                     continue
                 
                 # Get individual scores (default to 0 if missing)
@@ -315,6 +460,24 @@ class StartupRanker:
                 })
         
         df = pd.DataFrame(scores)
+        if df.empty:
+            df = pd.DataFrame(
+                columns=[
+                    "entity_name",
+                    "cluster_id",
+                    "centrality",
+                    "kpi_stance",
+                    "kpi_momentum",
+                    "kpi_risk",
+                    "recency",
+                    "investor_quality",
+                    "composite_score",
+                    "rank",
+                ]
+            )
+            print("\n[WARN] No entity-cluster pairs found. Did you run `CODE/graph_build.py`?")
+            print("[WARN] If you want cluster-wise rankings, also run `CODE/analysis_article_communities.py`.")
+            return df
         
         # Rank within each cluster
         df['rank'] = df.groupby('cluster_id')['composite_score'].rank(ascending=False, method='dense')
@@ -326,22 +489,15 @@ class StartupRanker:
     def store_scores_in_neo4j(self, df: pd.DataFrame):
         """Store computed scores back into Neo4j for fast retrieval."""
         print("\nStoring scores in Neo4j...")
+        if df is None or df.empty:
+            print("[WARN] No rankings to store (empty DataFrame).")
+            return
         
         with self.driver.session() as session:
             for _, row in df.iterrows():
-                session.run("""
-                    MATCH (c:Cluster {id: $cluster_id})-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity {name: $entity_name})
-                    WITH e, c, $score as score, $rank as rank
-                    MERGE (e)-[r:RANKED_IN]->(c)
-                    SET r.score = score, r.rank = rank,
-                        r.centrality = $centrality,
-                        r.kpi_stance = $kpi_stance,
-                        r.kpi_momentum = $kpi_momentum,
-                        r.kpi_risk = $kpi_risk,
-                        r.recency = $recency,
-                        r.investor_quality = $investor_quality
-                """, {
-                    'cluster_id': int(row['cluster_id']),
+                cid = int(row.get("cluster_id", 0) or 0)
+                params = {
+                    'cluster_id': cid,
                     'entity_name': row['entity_name'],
                     'score': float(row['composite_score']),
                     'rank': int(row['rank']),
@@ -351,7 +507,34 @@ class StartupRanker:
                     'kpi_risk': float(row.get('kpi_risk', 0.0) or 0.0),
                     'recency': float(row['recency']),
                     'investor_quality': float(row['investor_quality'])
-                })
+                }
+
+                if cid == 0:
+                    session.run("""
+                        MATCH (e:Entity {name: $entity_name})
+                        MERGE (c:Cluster {id: 0})
+                        MERGE (e)-[r:RANKED_IN]->(c)
+                        SET r.score = $score, r.rank = $rank,
+                            r.centrality = $centrality,
+                            r.kpi_stance = $kpi_stance,
+                            r.kpi_momentum = $kpi_momentum,
+                            r.kpi_risk = $kpi_risk,
+                            r.recency = $recency,
+                            r.investor_quality = $investor_quality
+                    """, params)
+                else:
+                    session.run("""
+                        MATCH (c:Cluster {id: $cluster_id})-[:HAS]->(a:Article)-[:MENTIONS]->(e:Entity {name: $entity_name})
+                        WITH e, c, $score as score, $rank as rank
+                        MERGE (e)-[r:RANKED_IN]->(c)
+                        SET r.score = score, r.rank = rank,
+                            r.centrality = $centrality,
+                            r.kpi_stance = $kpi_stance,
+                            r.kpi_momentum = $kpi_momentum,
+                            r.kpi_risk = $kpi_risk,
+                            r.recency = $recency,
+                            r.investor_quality = $investor_quality
+                    """, params)
         
         print("[OK] Scores stored with :RANKED_IN relationships")
     
@@ -386,6 +569,9 @@ def main():
     try:
         # Compute all scores
         df_rankings = ranker.compute_composite_scores()
+        if df_rankings is None or df_rankings.empty:
+            print("[WARN] No rankings computed. Skipping store/export.")
+            return
         
         # Display top 20 overall
         print("\n" + "="*80)

@@ -11,6 +11,19 @@ import extract_llm
 
 
 class TestExtractLlm(unittest.TestCase):
+    def test_parse_first_json_object_ignores_trailing_text(self):
+        raw = '{"a": 1, "entities": [], "kpis": [], "swot": [], "stance": 0.0}\n\nextra commentary'
+        obj = extract_llm.parse_first_json_object(raw)
+        self.assertIsInstance(obj, dict)
+        self.assertEqual(obj.get("a"), 1)
+
+    def test_parse_first_json_object_does_not_span_multiple_objects(self):
+        raw = '{"entities": [], "kpis": [], "swot": [], "stance": 0.0}{"oops":true}'
+        obj = extract_llm.parse_first_json_object(raw)
+        self.assertIsInstance(obj, dict)
+        self.assertIn("entities", obj)
+        self.assertNotIn("oops", obj)
+
     def test_process_single_row_emits_meta_on_no_json(self):
         original = extract_llm.extract_from_snippet
         try:

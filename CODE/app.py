@@ -93,7 +93,12 @@ if prompt := st.chat_input("Ask about market trends, competitors, or SWOT analys
                         
                     st.markdown("### Relevant Articles")
                     for doc in result['vector_context']:
-                        st.markdown(f"- **{doc['source']}** ({doc.get('published', 'N/A')}): {doc['text'][:200]}...")
+                        title = doc.get("title") or "Untitled"
+                        link = doc.get("link") or ""
+                        published = doc.get("published", "N/A")
+                        excerpt = (doc.get("text") or "")[:200].replace("\n", " ").strip()
+                        tail = f" — {link}" if link else ""
+                        st.markdown(f"- **{doc['source']}** ({published}): {title}{tail}\n  - {excerpt}...")
                         
             except Exception as e:
                 st.error(f"An error occurred: {e}")

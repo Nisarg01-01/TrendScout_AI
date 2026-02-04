@@ -146,7 +146,8 @@ class TemporalFeatureEngine:
             return {
                 'total_count': 0,
                 'unique_roles': [],
-                'unique_skills': []
+                'unique_skills': [],
+                'velocity_per_month': 0.0,
             }
         
         # Filter by date window

@@ -7,6 +7,8 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import os
 import re
+import argparse
+import shutil
 from urllib.parse import urlsplit
 from typing import Iterable
 import hashlib
@@ -47,6 +49,13 @@ _BOILERPLATE_PATTERNS: list[re.Pattern] = [
     re.compile(r"\bPrivacy Notice\b", re.IGNORECASE),
     re.compile(r"\bSubscribe\b", re.IGNORECASE),
     re.compile(r"\bRelated\b", re.IGNORECASE),
+    # TechCrunch promo / event blocks that commonly leak into extracted HTML.
+    re.compile(r"\bStartups Weekly\b", re.IGNORECASE),
+    re.compile(r"\bDisrupt 20\d{2}\b", re.IGNORECASE),
+    re.compile(r"\bTickets are live\b", re.IGNORECASE),
+    re.compile(r"\bOne-time offer\b", re.IGNORECASE),
+    re.compile(r"\bSave up to\b", re.IGNORECASE),
+    re.compile(r"\bMeet investors\b", re.IGNORECASE),
 ]
 
 
@@ -79,8 +88,16 @@ def _text_quality_score(text: str) -> float:
                 penalty += 0.5
             elif "subscribe" in p or "related" in p:
                 penalty += 0.35
+            elif "disrupt" in p or "tickets are live" in p or "meet investors" in p:
+                penalty += 0.35
             else:
                 penalty += 0.2
+
+    # Penalize pages that look like lists of headlines + timestamps (common in sidebars/topic pages).
+    if len(re.findall(r"\b\d+\s+(?:hours?|days?|minutes?)\s+ago\b", t_l)) >= 3:
+        penalty += 0.35
+    if len(re.findall(r"\b\d+\s+min\b", t_l)) >= 3:
+        penalty += 0.2
     # Penalize extremely long "menu-like" blobs with very low punctuation density.
     punct = sum(1 for ch in t if ch in ".?!;:")
     if len(t) > 1200 and punct / max(1, len(t)) < 0.002:
@@ -90,6 +107,33 @@ def _text_quality_score(text: str) -> float:
     if alpha / max(1, len(t)) < 0.55:
         penalty += 0.2
     return max(0.0, 1.0 - penalty)
+
+
+def _should_skip_full_text_fetch(url: str) -> bool:
+    """
+    Decide whether to skip HTML full-text fetching for a URL.
+
+    Some URLs (e.g., TechCrunch /video/ landing pages) consistently produce non-article boilerplate
+    and should fall back to RSS summaries for cleaner snippets.
+    """
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+
+    patterns = getattr(config, "SKIP_FULL_TEXT_URL_PATTERNS", []) or []
+    for p in patterns:
+        ps = str(p).strip().lower()
+        if ps and ps in u:
+            return True
+
+    # Safe built-in default (in case config is missing).
+    parts = urlsplit(u)
+    host = parts.netloc or ""
+    path = parts.path or ""
+    if "techcrunch.com" in host and path.startswith("/video/"):
+        return True
+
+    return False
 
 
 def extract_text_from_html(html: str) -> str:
@@ -111,6 +155,14 @@ def extract_text_from_html(html: str) -> str:
             s = el.get_text(" ", strip=True)
             s = _normalize_text(s)
             if len(s) < 20:
+                continue
+            s_l = s.lower()
+            # Skip common "headline list" artifacts (timestamps / promos) that aren't article body text.
+            if re.search(r"\b\d+\s+(?:hours?|days?|minutes?)\s+ago\b", s_l):
+                continue
+            if re.search(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", s_l):
+                continue
+            if "tickets are live" in s_l or "one-time offer" in s_l or "startups weekly" in s_l:
                 continue
             parts.append(s)
         text = "\n".join(parts)
@@ -139,6 +191,8 @@ def fetch_full_text(url: str, timeout_s: int = 15) -> str:
     if requests is None:
         return ""
     if not getattr(config, "FETCH_FULL_TEXT", True):
+        return ""
+    if _should_skip_full_text_fetch(url):
         return ""
 
     try:
@@ -348,6 +402,39 @@ def save_articles(new_df: pd.DataFrame):
     print(f"Saved {len(new_df)} new articles. Total: {len(combined_df)}")
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Ingest RSS feeds into DATA/articles_raw.parquet (incremental by default)."
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete DATA/articles_raw.parquet before ingest (writes a .bak_* backup first).",
+    )
+    parser.add_argument(
+        "--max-entries-per-feed",
+        type=int,
+        default=None,
+        help="Override config.MAX_ENTRIES_PER_FEED for this run (useful for quick smoke tests).",
+    )
+    args = parser.parse_args()
+
+    if args.max_entries_per_feed is not None and int(args.max_entries_per_feed) > 0:
+        config.MAX_ENTRIES_PER_FEED = int(args.max_entries_per_feed)
+
+    if args.fresh and os.path.exists(config.ARTICLES_FILE):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        bak = f"{config.ARTICLES_FILE}.bak_{stamp}"
+        try:
+            shutil.copy2(config.ARTICLES_FILE, bak)
+            print(f"[INFO] --fresh enabled. Backup written: {bak}")
+        except Exception:
+            print("[WARN] Could not create backup for existing articles file.")
+        try:
+            os.remove(config.ARTICLES_FILE)
+            print(f"[INFO] Removed existing articles file: {config.ARTICLES_FILE}")
+        except Exception as e:
+            raise SystemExit(f"Failed to remove existing articles file: {e}")
+
     df = fetch_all_feeds()
     save_articles(df)
 

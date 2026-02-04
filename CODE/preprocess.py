@@ -27,6 +27,9 @@ def clean_text(text: str) -> str:
         "By submitting your email",
         "Terms and Privacy Notice",
         "Privacy Notice",
+        "Startups Weekly",
+        "Tickets are live",
+        "One-time offer",
     ]
     for p in boilerplate_phrases:
         t = re.sub(re.escape(p), " ", t, flags=re.IGNORECASE)
@@ -35,6 +38,8 @@ def clean_text(text: str) -> str:
     t = re.sub(r"(?i)\bby submitting your email\b.*?(?=(\bRelated\b|$))", " ", t)
     t = re.sub(r"(?i)\bRelated\b\s+.*$", " ", t)
     t = re.sub(r"(?i)\bsubscribe\b\s+.*?(?=$)", " ", t)
+    # Drop sidebar timestamp fragments that show up in headline lists.
+    t = re.sub(r"(?i)\b\d+\s+(?:hours?|days?|minutes?)\s+ago\b", " ", t)
 
     t = re.sub(r"\s+", " ", t).strip()
     return t
@@ -167,9 +172,10 @@ def process_articles(rebuild: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="Preprocess articles into deterministic snippets.")
     parser.add_argument("--rebuild", action="store_true", help="Rebuild snippets.parquet from scratch (overwrites file).")
+    parser.add_argument("--fresh", action="store_true", help="Alias for --rebuild.")
     args = parser.parse_args()
 
-    process_articles(rebuild=bool(args.rebuild))
+    process_articles(rebuild=bool(args.rebuild) or bool(args.fresh))
 
 if __name__ == "__main__":
     main()
